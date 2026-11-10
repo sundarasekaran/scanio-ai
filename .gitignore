@@ -1,0 +1,32 @@
+# Secrets & Environment Files
+.env
+.env.*
+!.env.example
+*.local
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Node / Frontend Build
+node_modules/
+dist/
+dist-ssr/
+.output/
+.wrangler/
+.nitro/
+.tanstack/
+*.log
+
+# Model weights / datasets
+models/**/*.pt
+models/**/*.onnx
+models/**/*.h5
+datasets/
+runs/
+
+# OS / Editor
+.DS_Store
+.idea/
