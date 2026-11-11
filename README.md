@@ -47,4 +47,23 @@ npm test
 npm run build
 ```
 
+## Deploy as a Live Website
+
+### 1. Backend on Render (Free Tier via `render.yaml`)
+
+1. Sign in at [Render](https://render.com) with GitHub.
+2. Click **New → Blueprint** and select `sundarasekaran/scanio-ai`.
+3. Render reads [`render.yaml`](./render.yaml) (`plan: free`, `rootDir: backend`).
+4. Paste your **`OPENROUTER_API_KEY`** when prompted and click **Apply**.
+5. Once live, copy your backend URL (e.g., `https://scanio-ai-backend.onrender.com`) and confirm `https://<your-backend>.onrender.com/health` returns `{"status":"ok"}`.
+
+### 2. Frontend on Vercel (Free Hobby Tier)
+
+1. Sign in at [Vercel](https://vercel.com) with GitHub.
+2. Click **Add New… → Project** and import `sundarasekaran/scanio-ai`.
+3. Set **Root Directory** to **`frontend`** (`frontend/vercel.json` configures the `tanstack-start` preset automatically).
+4. Add Environment Variable:
+   - `VITE_PREDICTION_API_URL` = `https://<your-render-service>.onrender.com/api/v1/predict`
+5. Click **Deploy**. Any `*.vercel.app` domain is allowed by `CORS_ORIGIN_REGEX` on the backend by default (set `CORS_ORIGINS` on Render if you add a custom domain).
+
 > **Security Note**: Never commit `.env` or `.env.local` files or expose `OPENROUTER_API_KEY` in frontend `VITE_*` variables.

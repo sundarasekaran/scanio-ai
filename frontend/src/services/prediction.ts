@@ -58,7 +58,7 @@ export interface PredictionResult {
 }
 
 const DEFAULT_PREDICTION_API_URL = "http://127.0.0.1:8000/api/v1/predict";
-const REQUEST_TIMEOUT_MS = 90_000;
+const REQUEST_TIMEOUT_MS = 150_000;
 
 /**
  * Returns the configured prediction API endpoint.
@@ -68,6 +68,20 @@ const REQUEST_TIMEOUT_MS = 90_000;
 export function getPredictionApiUrl(): string {
   const envUrl = (import.meta.env["VITE_PREDICTION_API_URL"] as string | undefined)?.trim();
   return envUrl && envUrl.length > 0 ? envUrl : DEFAULT_PREDICTION_API_URL;
+}
+
+/**
+ * Fires a lightweight non-blocking health ping so sleeping free-tier
+ * backends (e.g. Render Free) warm up before the user submits images.
+ */
+export function wakeBackend(): void {
+  const apiUrl = getPredictionApiUrl();
+  try {
+    const url = new URL(apiUrl);
+    void fetch(`${url.origin}/health`, { method: "GET" }).catch(() => {});
+  } catch {
+    // Ignore malformed custom URL during background warm-up.
+  }
 }
 
 interface RawFindingInput {
@@ -285,12 +299,15 @@ export async function analyzeDentalImages(
     });
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
-      throw new Error("Screening request timed out after 90 seconds. Please try again.");
+      throw new Error("Screening request timed out. If your free backend was asleep, please try again in a few seconds.");
     }
     const errorMsg = err instanceof Error ? err.message : String(err);
     if (errorMsg.includes("Failed to fetch") || errorMsg.includes("NetworkError") || errorMsg.includes("fetch")) {
+      const isLocal = apiUrl.includes("127.0.0.1") || apiUrl.includes("localhost");
       throw new Error(
-        `Unable to reach the Python backend at ${apiUrl}. Please ensure the FastAPI backend server is running on http://127.0.0.1:8000.`
+        isLocal
+          ? `Unable to reach the Python backend at ${apiUrl}. Please ensure the FastAPI backend server is running on http://127.0.0.1:8000.`
+          : `Unable to reach the screening backend at ${apiUrl}. If using a free-tier host (such as Render), wait 30-60 seconds for it to wake up and retry.`
       );
     }
     throw new Error(`Connection error: ${errorMsg}`);

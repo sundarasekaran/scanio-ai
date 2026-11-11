@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { analyzeDentalImages } from "./prediction";
+import { analyzeDentalImages, wakeBackend } from "./prediction";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -141,5 +141,13 @@ describe("prediction service", () => {
     expect(res.inconclusive).toBe(true);
     expect(res.inconclusiveViews).toEqual(["upper", "lower", "front"]);
     expect(res.statusMessage).toBe("Screening inconclusive");
+  });
+
+  it("pings backend /health endpoint quietly on wakeBackend()", () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"status":"ok"}'));
+    vi.stubGlobal("fetch", fetchMock);
+    wakeBackend();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toMatch(/\/health$/);
   });
 });

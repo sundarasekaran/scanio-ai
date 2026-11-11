@@ -1,10 +1,10 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertCircle, CheckCircle2, ImagePlus, Loader2, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, Disclaimer } from "@/components/shared";
-import { analyzeDentalImages, VIEWS, type ViewKey } from "@/services/prediction";
+import { analyzeDentalImages, VIEWS, wakeBackend, type ViewKey } from "@/services/prediction";
 import { saveScreening, useUser } from "@/services/store";
 
 export const Route = createFileRoute("/upload")({
@@ -78,6 +78,10 @@ function UploadPage() {
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const done = VIEWS.filter((v) => slots[v.key]).length;
+
+  useEffect(() => {
+    wakeBackend();
+  }, []);
 
   const pick = async (key: ViewKey, f?: File) => {
     if (!f) return;

@@ -492,6 +492,20 @@ class BackendTestCase(unittest.TestCase):
             self.assertEqual(resp.status_code, expected_code)
             self.assertIn("detail", resp.json())
 
+    def test_cors_allows_vercel_origins(self):
+        resp = self.client.options(
+            "/api/v1/predict",
+            headers={
+                "Origin": "https://scanio-ai-preview.vercel.app",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.headers.get("access-control-allow-origin"),
+            "https://scanio-ai-preview.vercel.app",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
