@@ -2,6 +2,7 @@ import logging
 import os
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import UnidentifiedImageError
 
@@ -103,7 +104,7 @@ async def predict(
         "front": await validate_image(front, "Front view"),
     }
     try:
-        result = run_screening(images)
+        result = await run_in_threadpool(run_screening, images)
         return ScreeningResponse.model_validate(result)
     except (ModelNotReady, OpenRouterConfigError) as exc:
         logger.warning("Screening blocked - vision provider not configured: %s", sanitize_secret(str(exc)))

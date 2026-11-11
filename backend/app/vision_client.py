@@ -123,9 +123,10 @@ MAX_ALIGNMENT_WIDTH = 0.65
 MAX_ALIGNMENT_HEIGHT = 0.45
 MIN_TOOTH_BOX_SIZE = 0.02
 MIN_FINDING_CONFIDENCE = 0.30
-OPENROUTER_REQUEST_TIMEOUT_SEC = 60
-OPENROUTER_MAX_TOKENS = 6144
-MAX_TRANSIENT_RETRIES = 2
+OPENROUTER_REQUEST_TIMEOUT_SEC = 40
+OPENROUTER_MAX_TOKENS = 4096
+NVIDIA_MAX_TOKENS = 4096
+MAX_TRANSIENT_RETRIES = 1
 
 _SOFT_TISSUE_ONLY_RE = re.compile(
     r"\b(hard palate|soft palate|palatal rugae|roof of (?:the )?mouth|tongue|uvula|cheek mucosa|lip|facial skin|empty mouth|empty oral cavity)\b",
@@ -1427,7 +1428,7 @@ def _extract_openrouter_text(result: dict, view_name: str) -> str:
 
 
 def _parse_json_response(text_content: str, view_name: str) -> dict | list:
-    stripped = text_content.strip()
+    stripped = re.sub(r"<think>[\s\S]*?</think>", "", text_content, flags=re.IGNORECASE).strip()
     try:
         parsed = json.loads(stripped)
         if isinstance(parsed, (dict, list)):
@@ -1812,7 +1813,7 @@ def _build_chat_payload(
     payload: dict = {
         "model": model,
         "temperature": 0.0,
-        "max_tokens": OPENROUTER_MAX_TOKENS,
+        "max_tokens": NVIDIA_MAX_TOKENS if provider == "nvidia" else OPENROUTER_MAX_TOKENS,
         "messages": [
             {"role": "system", "content": DENTAL_SYSTEM_PROMPT},
             {
@@ -1945,6 +1946,7 @@ def analyze_with_vision_provider(
     upright_bytes = normalize_image_orientation(image_bytes, detected_mime)
     quality = assess_image_quality(upright_bytes)
     enamel_mask = compute_tooth_enamel_mask(upright_bytes)
+    t_view_start = time.monotonic()
 
     url = f"{base_url.rstrip('/')}/chat/completions"
     caps = capabilities or {}
@@ -1961,6 +1963,13 @@ def analyze_with_vision_provider(
         result = _send_openrouter_chat_request(url, payload, api_key, model, view_name)
     else:
         result = _send_chat_request(url, payload, api_key, model, view_name, provider=provider)
+    logger.info(
+        "%s (%s) full-frame analysis finished for %s in %.2fs",
+        provider.upper(),
+        model,
+        view_name,
+        time.monotonic() - t_view_start,
+    )
     text_content = _extract_openrouter_text(result, view_name)
     parsed = _parse_json_response(text_content, view_name)
     extracted = _parse_parsed_payload(parsed, view_name)
@@ -2003,13 +2012,14 @@ def analyze_with_vision_provider(
 
     needs_crop_fallback = (
         enable_crop_fallback
+        and (time.monotonic() - t_view_start) <= 42.0
         and quality.get("width", 0) >= 200
         and quality.get("height", 0) >= 200
         and quality.get("qualityStatus") != "too_small"
         and (
             (ai_inconclusive and quality.get("qualityStatus") in ("good", "soft_focus", "dark", "overexposed"))
             or (rejected_count > 0 and not (valid_conditions or valid_alignment))
-            or (view_name.lower() == "lower" and (not valid_conditions or not valid_alignment))
+            or (view_name.lower() == "lower" and not valid_conditions and not valid_alignment)
         )
     )
 
