@@ -523,6 +523,7 @@ class BackendTestCase(unittest.TestCase):
         self.assertEqual(second_req.get_header("Authorization"), "Bearer nvapi-test-secret")
         sent_body = json.loads(second_req.data.decode("utf-8"))
         self.assertEqual(sent_body["response_format"], {"type": "json_object"})
+        self.assertEqual(sent_body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertTrue(sent_body["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/webp;base64,"))
 
     def test_prepare_image_for_nvidia_size_limit(self):

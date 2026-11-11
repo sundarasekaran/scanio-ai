@@ -123,9 +123,9 @@ MAX_ALIGNMENT_WIDTH = 0.65
 MAX_ALIGNMENT_HEIGHT = 0.45
 MIN_TOOTH_BOX_SIZE = 0.02
 MIN_FINDING_CONFIDENCE = 0.30
-OPENROUTER_REQUEST_TIMEOUT_SEC = 40
+OPENROUTER_REQUEST_TIMEOUT_SEC = 48
 OPENROUTER_MAX_TOKENS = 4096
-NVIDIA_MAX_TOKENS = 4096
+NVIDIA_MAX_TOKENS = 2400
 MAX_TRANSIENT_RETRIES = 1
 
 _SOFT_TISSUE_ONLY_RE = re.compile(
@@ -1568,6 +1568,10 @@ def _send_chat_request(
                     current_payload = merged
                     continue
 
+            if exc.code == 400 and "chat_template_kwargs" in current_payload:
+                current_payload = {k: v for k, v in current_payload.items() if k != "chat_template_kwargs"}
+                continue
+
             raise _classify_provider_http_error(
                 exc.code, raw_msg, api_key, model, view_name=view_name, provider=provider
             ) from exc
@@ -1839,7 +1843,9 @@ def _build_chat_payload(
     elif caps.get("responseFormatSupported"):
         payload["response_format"] = {"type": "json_object"}
 
-    if provider == "openrouter" and caps.get(
+    if provider == "nvidia":
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    elif caps.get(
         "supportsReasoning", "gemini-2.5" in model.lower() or "gemini-3" in model.lower()
     ):
         payload["reasoning"] = {"max_tokens": 2048}
