@@ -1,0 +1,23 @@
+[
+  {
+    "id": "patient_001_lower",
+    "view": "lower",
+    "split": "test",
+    "imagePath": "path/to/test/patient_001_lower.jpg",
+    "annotator": "licensed_dentist_id",
+    "groundTruth": [
+      {
+        "category": "condition",
+        "condition": "tartar_calculus",
+        "tooth": "41",
+        "box": { "x": 0.46, "y": 0.72, "w": 0.06, "h": 0.08 }
+      },
+      {
+        "category": "alignment",
+        "findingType": "crowding",
+        "involvedTeeth": ["31", "32", "41", "42"],
+        "box": { "x": 0.37, "y": 0.71, "w": 0.25, "h": 0.14 }
+      }
+    ]
+  }
+]

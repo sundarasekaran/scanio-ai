@@ -143,6 +143,66 @@ describe("prediction service", () => {
     expect(res.statusMessage).toBe("Screening inconclusive");
   });
 
+  it("preserves explicit viewStatuses, moduleStatuses, imageQuality, and viewDiagnostics", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        overallScore: 84,
+        inconclusive: false,
+        viewStatuses: {
+          upper: "assessed_with_findings",
+          lower: "assessed_with_findings",
+          front: "assessed_no_findings",
+        },
+        moduleStatuses: {
+          toothConditions: {
+            upper: "assessed_with_findings",
+            lower: "assessed_no_findings",
+            front: "assessed_no_findings",
+          },
+          dentalAlignment: {
+            upper: "assessed_no_findings",
+            lower: "assessed_with_findings",
+            front: "assessed_no_findings",
+          },
+        },
+        imageQuality: {
+          lower: {
+            width: 1600,
+            height: 1395,
+            aspectRatio: 1.147,
+            minDimension: 1395,
+            laplacianVariance: 23.3,
+            edgeContrast: 12.1,
+            meanBrightness: 148.9,
+            qualityStatus: "soft_focus",
+            qualityNotes: "Moderate softness",
+          },
+        },
+        viewDiagnostics: {
+          lower: {
+            viewStatus: "assessed_with_findings",
+            conditionStatus: "assessed_no_findings",
+            alignmentStatus: "assessed_with_findings",
+            unassessableTeethReason: "Third molars out of frame",
+            rawConditionsCount: 0,
+            rawAlignmentCount: 1,
+            rejectedCount: 0,
+            cropPassUsed: true,
+            cropsAnalyzed: ["anterior", "left_posterior", "right_posterior"],
+          },
+        },
+        views: { upper: [], lower: [], front: [] },
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await analyzeDentalImages(makeFiles());
+    expect(res.viewStatuses?.lower).toBe("assessed_with_findings");
+    expect(res.moduleStatuses?.dentalAlignment?.lower).toBe("assessed_with_findings");
+    expect(res.imageQuality?.lower?.qualityStatus).toBe("soft_focus");
+    expect(res.viewDiagnostics?.lower?.cropPassUsed).toBe(true);
+  });
+
   it("pings backend /health endpoint quietly on wakeBackend()", () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"status":"ok"}'));
     vi.stubGlobal("fetch", fetchMock);

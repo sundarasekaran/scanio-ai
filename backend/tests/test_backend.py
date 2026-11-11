@@ -24,12 +24,15 @@ from app.vision_client import (
     _extract_openrouter_text,
     _parse_json_response,
     analyze_with_openrouter,
+    assess_image_quality,
     compute_tooth_enamel_mask,
     detect_image_mime_type,
+    generate_arch_crops,
     is_in_lower_tongue_exclusion_zone,
     is_in_palatal_exclusion_zone,
     is_valid_tooth_box,
     load_backend_env,
+    map_crop_box_to_original,
     normalize_image_orientation,
     sanitize_and_normalize_finding,
     sanitize_secret,
@@ -505,6 +508,242 @@ class BackendTestCase(unittest.TestCase):
             resp.headers.get("access-control-allow-origin"),
             "https://scanio-ai-preview.vercel.app",
         )
+
+    def test_assess_image_quality_metrics(self):
+        # Sharp patterned 300x240 image -> good quality
+        sharp_im = Image.new("RGB", (300, 240), color=(235, 230, 215))
+        for y in range(20, 220, 8):
+            for x in range(20, 280):
+                sharp_im.putpixel((x, y), (90, 80, 75))
+        buf_sharp = BytesIO()
+        sharp_im.save(buf_sharp, format="JPEG", quality=95)
+        q_sharp = assess_image_quality(buf_sharp.getvalue())
+        self.assertEqual(q_sharp["width"], 300)
+        self.assertEqual(q_sharp["height"], 240)
+        self.assertEqual(q_sharp["qualityStatus"], "good")
+        self.assertGreater(q_sharp["laplacianVariance"], 28.0)
+
+        # Flat/blurry image -> very_blurry
+        flat_buf = BytesIO()
+        Image.new("RGB", (240, 240), color=(140, 140, 140)).save(flat_buf, format="PNG")
+        q_flat = assess_image_quality(flat_buf.getvalue())
+        self.assertEqual(q_flat["qualityStatus"], "very_blurry")
+
+        # Tiny thumbnail -> too_small
+        tiny_buf = BytesIO()
+        Image.new("RGB", (40, 40), color="white").save(tiny_buf, format="PNG")
+        q_tiny = assess_image_quality(tiny_buf.getvalue())
+        self.assertEqual(q_tiny["qualityStatus"], "too_small")
+
+    @patch("app.vision_client._send_openrouter_chat_request")
+    def test_crop_coordinate_translation_and_lower_fallback_recovery(self, mock_chat):
+        # Build 400x400 synthetic lower arch: pink interior mucosa + ivory tooth rim at bottom/sides
+        im = Image.new("RGB", (400, 400), color=(190, 110, 110))
+        for y in range(290, 360):
+            for x in range(80, 320):
+                im.putpixel((x, y), (242, 238, 224))
+        for y in range(100, 280):
+            for x in range(20, 95):
+                im.putpixel((x, y), (242, 238, 224))
+            for x in range(305, 380):
+                im.putpixel((x, y), (242, 238, 224))
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=95)
+        lower_bytes = buf.getvalue()
+
+        # Verify crop coordinate mapping math
+        mapped_box, mapped_b2d = map_crop_box_to_original(
+            {"x": 0.5, "y": 0.5, "w": 0.25, "h": 0.2},
+            (0.14, 0.48, 0.72, 0.50),
+        )
+        self.assertAlmostEqual(mapped_box["x"], 0.50, places=3)
+        self.assertAlmostEqual(mapped_box["y"], 0.73, places=3)
+        self.assertAlmostEqual(mapped_box["w"], 0.18, places=3)
+        self.assertAlmostEqual(mapped_box["h"], 0.10, places=3)
+        self.assertEqual(len(mapped_b2d), 4)
+
+        crops = generate_arch_crops(lower_bytes, "image/jpeg", "lower")
+        self.assertEqual([c["region"] for c in crops], ["anterior", "left_posterior", "right_posterior"])
+
+        def _wrap(obj):
+            return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(obj)}}]}
+
+        # Full-frame falsely reports inconclusive; anterior crop detects mandibular anterior crowding
+        mock_chat.side_effect = [
+            _wrap(
+                {
+                    "viewStatus": "inconclusive",
+                    "conditionStatus": "inconclusive",
+                    "alignmentStatus": "inconclusive",
+                    "inconclusiveReason": "Slightly soft mobile photo",
+                    "visibleToothSummary": "Lower incisors along bottom rim",
+                    "unassessableTeethReason": "Third molars out of frame",
+                    "toothConditions": [],
+                    "dentalAlignment": [],
+                }
+            ),
+            _wrap(
+                {
+                    "viewStatus": "assessed",
+                    "conditionStatus": "assessed_no_findings",
+                    "alignmentStatus": "assessed_with_findings",
+                    "visibleToothSummary": "Lower incisors 32, 31, 41, 42",
+                    "toothConditions": [],
+                    "dentalAlignment": [
+                        {
+                            "findingType": "crowding",
+                            "name": "Lower anterior crowding",
+                            "involvedTeeth": ["31", "32", "41", "42"],
+                            "gapMeasurement": "mild crowding across lower incisors",
+                            "confidence": 0.88,
+                            "severity": "moderate",
+                            "description": "Mild crowding of lower anterior incisors.",
+                            "recommendation": "Orthodontic consultation.",
+                            "box_2d": [540, 320, 780, 680],
+                        }
+                    ],
+                }
+            ),
+            _wrap(
+                {
+                    "viewStatus": "assessed",
+                    "conditionStatus": "assessed_no_findings",
+                    "alignmentStatus": "assessed_no_findings",
+                    "toothConditions": [],
+                    "dentalAlignment": [],
+                }
+            ),
+            _wrap(
+                {
+                    "viewStatus": "assessed",
+                    "conditionStatus": "assessed_no_findings",
+                    "alignmentStatus": "assessed_no_findings",
+                    "toothConditions": [],
+                    "dentalAlignment": [],
+                }
+            ),
+        ]
+
+        res = analyze_with_openrouter(
+            lower_bytes,
+            "lower",
+            "sk-or-v1-test",
+            "google/gemini-2.5-flash",
+            "https://openrouter.ai/api/v1",
+            mime_type="image/jpeg",
+        )
+        self.assertTrue(res["cropPassUsed"])
+        self.assertEqual(res["cropsAnalyzed"], ["anterior", "left_posterior", "right_posterior"])
+        self.assertEqual(res["viewStatus"], "assessed")
+        self.assertEqual(res["explicitViewStatus"], "assessed_with_findings")
+        self.assertEqual(res["conditionStatus"], "assessed_no_findings")
+        self.assertEqual(res["alignmentStatus"], "assessed_with_findings")
+        self.assertEqual(len(res["dentalAlignment"]), 1)
+        box = res["dentalAlignment"][0]["box"]
+        self.assertGreater(box["y"], 0.70)
+        self.assertEqual(res["unassessableTeethReason"], "Third molars out of frame")
+
+    @patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-v1-test-key"})
+    @patch("app.inference.verify_openrouter_model_availability")
+    @patch("app.inference.analyze_with_openrouter")
+    def test_predict_returns_explicit_per_module_view_statuses(self, mock_analyze, mock_verify):
+        mock_verify.return_value = {"valid": True, "status": "available"}
+        mock_analyze.side_effect = [
+            {
+                "viewStatus": "assessed",
+                "explicitViewStatus": "assessed_with_findings",
+                "conditionStatus": "assessed_with_findings",
+                "alignmentStatus": "assessed_no_findings",
+                "toothConditions": [
+                    {
+                        "name": "Enamel Discoloration",
+                        "category": "condition",
+                        "confidence": 0.85,
+                        "severity": "low",
+                        "description": "Mild enamel stain.",
+                        "recommendation": "Routine hygiene.",
+                        "box": {"x": 0.70, "y": 0.45, "w": 0.09, "h": 0.10},
+                        "tooth": "26",
+                        "toothNumber": "26",
+                    }
+                ],
+                "dentalAlignment": [],
+                "all": [
+                    {
+                        "name": "Enamel Discoloration",
+                        "category": "condition",
+                        "confidence": 0.85,
+                        "severity": "low",
+                        "description": "Mild enamel stain.",
+                        "recommendation": "Routine hygiene.",
+                        "box": {"x": 0.70, "y": 0.45, "w": 0.09, "h": 0.10},
+                        "tooth": "26",
+                        "toothNumber": "26",
+                    }
+                ],
+                "rejectedCount": 0,
+            },
+            {
+                "viewStatus": "assessed",
+                "explicitViewStatus": "assessed_no_findings",
+                "conditionStatus": "assessed_no_findings",
+                "alignmentStatus": "assessed_no_findings",
+                "toothConditions": [],
+                "dentalAlignment": [],
+                "all": [],
+                "rejectedCount": 0,
+                "unassessableTeethReason": "Third molars outside frame",
+                "cropPassUsed": True,
+                "cropsAnalyzed": ["anterior", "left_posterior", "right_posterior"],
+            },
+            {
+                "viewStatus": "inconclusive",
+                "explicitViewStatus": "inconclusive",
+                "conditionStatus": "inconclusive",
+                "alignmentStatus": "inconclusive",
+                "inconclusiveReason": "Motion blur obscures front teeth.",
+                "toothConditions": [],
+                "dentalAlignment": [],
+                "all": [],
+                "rejectedCount": 0,
+            },
+        ]
+
+        files = {
+            "upper": ("upper.jpg", self.dummy_img, "image/jpeg"),
+            "lower": ("lower.jpg", self.dummy_img, "image/jpeg"),
+            "front": ("front.jpg", self.dummy_img, "image/jpeg"),
+        }
+        resp = self.client.post("/api/v1/predict", files=files)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(
+            data["viewStatuses"],
+            {
+                "upper": "assessed_with_findings",
+                "lower": "assessed_no_findings",
+                "front": "inconclusive",
+            },
+        )
+        self.assertEqual(
+            data["moduleStatuses"]["toothConditions"],
+            {
+                "upper": "assessed_with_findings",
+                "lower": "assessed_no_findings",
+                "front": "inconclusive",
+            },
+        )
+        self.assertEqual(
+            data["moduleStatuses"]["dentalAlignment"],
+            {
+                "upper": "assessed_no_findings",
+                "lower": "assessed_no_findings",
+                "front": "inconclusive",
+            },
+        )
+        self.assertIn("lower", data["imageQuality"])
+        self.assertTrue(data["viewDiagnostics"]["lower"]["cropPassUsed"])
+        self.assertEqual(data["viewDiagnostics"]["lower"]["unassessableTeethReason"], "Third molars outside frame")
 
 
 if __name__ == "__main__":

@@ -7,8 +7,33 @@ import { Card, Disclaimer, SeverityBadge } from "@/components/shared";
 import { AnnotatedImage } from "@/components/AnnotatedImage";
 import { getScreening, useUser, type Screening } from "@/services/store";
 import { downloadReport } from "@/services/report";
-import { VIEWS, type DetectedCondition } from "@/services/prediction";
+import { VIEWS, type ModuleViewStatus } from "@/services/prediction";
 import { cn } from "@/lib/utils";
+
+const STATUS_BADGE: Record<ModuleViewStatus, { label: string; cls: string }> = {
+  assessed_with_findings: {
+    label: "Assessed · Findings",
+    cls: "bg-amber-500/15 text-amber-800 dark:text-amber-300 border-amber-500/30",
+  },
+  assessed_no_findings: {
+    label: "Assessed · No Findings",
+    cls: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/30",
+  },
+  inconclusive: {
+    label: "Inconclusive",
+    cls: "bg-rose-500/15 text-rose-700 dark:text-rose-300 border-rose-500/30",
+  },
+};
+
+function resolveModuleStatus(
+  explicit: ModuleViewStatus | undefined,
+  itemCount: number,
+  isInconclusive: boolean
+): ModuleViewStatus {
+  if (explicit) return explicit;
+  if (itemCount > 0) return "assessed_with_findings";
+  return isInconclusive ? "inconclusive" : "assessed_no_findings";
+}
 
 export const Route = createFileRoute("/results/$id")({
   head: () => ({
@@ -205,6 +230,18 @@ function Results() {
         const alignmentFindings = fullList.filter((c) => c.category === "alignment");
         const viewInconclusiveReason = s.inconclusiveReasons?.[v.key];
         const isViewInconclusive = inconclusiveViews.includes(v.key) || Boolean(viewInconclusiveReason);
+        const condStatus = resolveModuleStatus(
+          s.moduleStatuses?.toothConditions?.[v.key],
+          surfaceConditions.length,
+          isViewInconclusive
+        );
+        const alignStatus = resolveModuleStatus(
+          s.moduleStatuses?.dentalAlignment?.[v.key],
+          alignmentFindings.length,
+          isViewInconclusive
+        );
+        const viewDiag = s.viewDiagnostics?.[v.key];
+        const viewQuality = s.imageQuality?.[v.key];
 
         const showConditions = selectedTab === "all" || selectedTab === "conditions";
         const showAlignment = selectedTab === "all" || selectedTab === "alignment";
@@ -213,11 +250,18 @@ function Results() {
           <Card key={v.key} className="grid gap-6 lg:grid-cols-[1fr_1.3fr]">
             {/* Left: Annotated Image Viewer */}
             <div className="space-y-3">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <h3 className="text-xl font-semibold">{v.label}</h3>
-                <span className="text-xs text-muted-foreground">
-                  {fullList.length} total {fullList.length === 1 ? "item" : "items"}
-                </span>
+                <div className="flex items-center gap-2">
+                  {viewQuality && (
+                    <span className="rounded-md bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                      {viewQuality.width}×{viewQuality.height} · {viewQuality.qualityStatus.replaceAll("_", " ")}
+                    </span>
+                  )}
+                  <span className="text-xs text-muted-foreground">
+                    {fullList.length} total {fullList.length === 1 ? "item" : "items"}
+                  </span>
+                </div>
               </div>
               <AnnotatedImage
                 src={s.images[v.key]}
@@ -226,6 +270,11 @@ function Results() {
                 offset={viewOffset}
               />
               <p className="text-xs text-muted-foreground italic">{v.hint}</p>
+              {viewDiag?.unassessableTeethReason && (
+                <p className="rounded-lg bg-muted/70 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+                  <b>Visibility note:</b> {viewDiag.unassessableTeethReason}
+                </p>
+              )}
             </div>
 
             {/* Right: Segregated Module Findings */}
@@ -240,13 +289,18 @@ function Results() {
                         Section A: Tooth Surface Findings
                       </h4>
                     </div>
-                    <span className="text-xs text-muted-foreground">
-                      {surfaceConditions.length} {surfaceConditions.length === 1 ? "finding" : "findings"}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className={cn("rounded-full border px-2 py-0.5 text-[10px] font-semibold", STATUS_BADGE[condStatus].cls)}>
+                        {STATUS_BADGE[condStatus].label}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {surfaceConditions.length} {surfaceConditions.length === 1 ? "finding" : "findings"}
+                      </span>
+                    </div>
                   </div>
 
                   {surfaceConditions.length === 0 ? (
-                    isViewInconclusive ? (
+                    condStatus === "inconclusive" ? (
                       <div className="flex items-center gap-2 rounded-xl bg-amber-500/10 p-3.5 text-xs text-amber-800 dark:text-amber-300 border border-amber-500/20">
                         <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
                         <span>{viewInconclusiveReason || "Inconclusive image: unable to reliably inspect tooth surfaces in this photo."}</span>
@@ -317,13 +371,18 @@ function Results() {
                         Section B: Dental Alignment Findings
                       </h4>
                     </div>
-                    <span className="text-xs text-muted-foreground">
-                      {alignmentFindings.length} {alignmentFindings.length === 1 ? "observation" : "observations"}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className={cn("rounded-full border px-2 py-0.5 text-[10px] font-semibold", STATUS_BADGE[alignStatus].cls)}>
+                        {STATUS_BADGE[alignStatus].label}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {alignmentFindings.length} {alignmentFindings.length === 1 ? "observation" : "observations"}
+                      </span>
+                    </div>
                   </div>
 
                   {alignmentFindings.length === 0 ? (
-                    isViewInconclusive ? (
+                    alignStatus === "inconclusive" ? (
                       <div className="flex items-center gap-2 rounded-xl bg-amber-500/10 p-3.5 text-xs text-amber-800 dark:text-amber-300 border border-amber-500/20">
                         <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
                         <span>{viewInconclusiveReason || "Inconclusive image: unable to reliably inspect dental alignment in this photo."}</span>
@@ -357,10 +416,10 @@ function Results() {
                             <SeverityBadge s={c.severity} />
                           </div>
 
-                          {/* Gap Measurement Callout */}
+                          {/* Qualitative Gap / Alignment Observation */}
                           {c.gapMeasurement && (
                             <div className="flex items-center gap-2 rounded-md bg-indigo-500/20 px-2.5 py-1 text-xs font-semibold text-indigo-800 dark:text-indigo-200">
-                              <span>📏 Measured Width:</span>
+                              <span>Observation:</span>
                               <span className="underline decoration-indigo-400">{c.gapMeasurement}</span>
                             </div>
                           )}

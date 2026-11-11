@@ -16,7 +16,7 @@ Enforces:
 """
 from io import BytesIO
 from pathlib import Path
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageFilter, ImageOps, ImageStat, UnidentifiedImageError
 import base64
 import json
 import logging
@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from dotenv import load_dotenv
 
-from app.prompts import DENTAL_SYSTEM_PROMPT, build_view_prompt
+from app.prompts import DENTAL_SYSTEM_PROMPT, build_crop_prompt, build_view_prompt
 
 logger = logging.getLogger("scanio.openrouter")
 
@@ -63,7 +63,15 @@ OPENROUTER_JSON_SCHEMA = {
     "properties": {
         "viewStatus": {
             "type": "string",
-            "enum": ["assessed", "inconclusive"],
+            "enum": ["assessed", "assessed_with_findings", "assessed_no_findings", "inconclusive"],
+        },
+        "conditionStatus": {
+            "type": "string",
+            "enum": ["assessed_with_findings", "assessed_no_findings", "inconclusive"],
+        },
+        "alignmentStatus": {
+            "type": "string",
+            "enum": ["assessed_with_findings", "assessed_no_findings", "inconclusive"],
         },
         "inconclusiveReason": {
             "type": ["string", "null"],
@@ -71,6 +79,10 @@ OPENROUTER_JSON_SCHEMA = {
         "visibleToothSummary": {
             "type": "string",
             "description": "Brief summary of visible tooth crowns localized in this photograph before assigning boxes.",
+        },
+        "unassessableTeethReason": {
+            "type": ["string", "null"],
+            "description": "Teeth or surfaces occluded, out of frame, or too blurry to assess reliably; null if all arch teeth are visible.",
         },
         "toothAnchorRegions": {
             "type": "object",
@@ -157,8 +169,11 @@ OPENROUTER_JSON_SCHEMA = {
     },
     "required": [
         "viewStatus",
+        "conditionStatus",
+        "alignmentStatus",
         "inconclusiveReason",
         "visibleToothSummary",
+        "unassessableTeethReason",
         "toothAnchorRegions",
         "toothConditions",
         "dentalAlignment",
@@ -518,7 +533,7 @@ def detect_image_mime_type(image_bytes: bytes) -> str:
 def normalize_image_orientation(image_bytes: bytes, mime_type: str) -> bytes:
     """
     Applies EXIF Orientation rotation if needed so the model analyzes the exact upright
-    orientation rendered by browser <img> and <canvas> elements.
+    orientation rendered by browser <img> and <canvas> elements without unnecessary recompression.
     """
     try:
         with Image.open(BytesIO(image_bytes)) as img:
@@ -531,10 +546,93 @@ def normalize_image_orientation(image_bytes: bytes, mime_type: str) -> bytes:
             fmt = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}.get(mime_type, "JPEG")
             if fmt == "JPEG" and transposed.mode not in ("RGB", "L"):
                 transposed = transposed.convert("RGB")
-            transposed.save(out, format=fmt, quality=92)
+            save_kwargs = {"format": fmt}
+            if fmt in ("JPEG", "WEBP"):
+                save_kwargs["quality"] = 95
+                if fmt == "JPEG":
+                    save_kwargs["subsampling"] = 0
+            transposed.save(out, **save_kwargs)
             return out.getvalue()
     except Exception:
         return image_bytes
+
+
+_LAPLACIAN_KERNEL = ImageFilter.Kernel(
+    (3, 3),
+    [0, 1, 0, 1, -4, 1, 0, 1, 0],
+    scale=1,
+    offset=128,
+)
+
+
+def assess_image_quality(image_bytes: bytes) -> dict:
+    """
+    Measures upright resolution, aspect ratio, brightness, edge contrast, and
+    Laplacian variance sharpness before calling the vision AI model.
+    """
+    try:
+        with Image.open(BytesIO(image_bytes)) as raw:
+            upright = ImageOps.exif_transpose(raw)
+            w, h = upright.size
+            gray = upright.convert("L")
+            norm = gray.copy()
+            norm.thumbnail((640, 640))
+            edges = norm.filter(ImageFilter.FIND_EDGES)
+            lap = norm.filter(_LAPLACIAN_KERNEL)
+            if norm.width > 8 and norm.height > 8:
+                inner = (2, 2, norm.width - 2, norm.height - 2)
+                edges = edges.crop(inner)
+                lap = lap.crop(inner)
+            edge_contrast = round(float(ImageStat.Stat(edges).stddev[0]), 2)
+            lap_var = round(float(ImageStat.Stat(lap).var[0]), 2)
+            mean_luma = round(float(ImageStat.Stat(norm).mean[0]), 1)
+    except Exception:
+        return {
+            "width": 0,
+            "height": 0,
+            "aspectRatio": 0.0,
+            "minDimension": 0,
+            "laplacianVariance": 0.0,
+            "edgeContrast": 0.0,
+            "meanBrightness": 0.0,
+            "qualityStatus": "unknown",
+            "qualityNotes": "Unable to measure image quality metrics.",
+        }
+
+    min_dim = min(w, h)
+    aspect_ratio = round(w / max(h, 1), 3)
+    notes: list[str] = []
+
+    if min_dim < 64:
+        q_status = "too_small"
+        notes.append("Image resolution is too small for reliable tooth-surface inspection.")
+    elif mean_luma < 32.0:
+        q_status = "dark"
+        notes.append("Photo appears very dark; tooth details may be underexposed.")
+    elif mean_luma > 248.0 and edge_contrast < 4.0:
+        q_status = "overexposed"
+        notes.append("Photo appears flat or overexposed.")
+    elif lap_var < 6.0 and edge_contrast < 5.0:
+        q_status = "very_blurry"
+        notes.append("Severe blur or motion smear detected; enamel details may be unclear.")
+    elif lap_var < 22.0:
+        q_status = "soft_focus"
+        notes.append("Moderate smartphone softness detected; crowns and spacing remain evaluable.")
+    else:
+        q_status = "good"
+        notes.append("Adequate resolution and sharpness for intraoral screening.")
+
+    return {
+        "width": w,
+        "height": h,
+        "aspectRatio": aspect_ratio,
+        "minDimension": min_dim,
+        "laplacianVariance": lap_var,
+        "edgeContrast": edge_contrast,
+        "meanBrightness": mean_luma,
+        "qualityStatus": q_status,
+        "qualityNotes": " ".join(notes),
+    }
 
 
 def compute_tooth_enamel_mask(image_bytes: bytes) -> dict | None:
@@ -652,7 +750,7 @@ def is_in_lower_tongue_exclusion_zone(box: dict, view_name: str) -> bool:
         return False
     center_x = box["x"] + (box["w"] / 2.0)
     center_y = box["y"] + (box["h"] / 2.0)
-    return 0.30 <= center_x <= 0.70 and 0.20 <= center_y <= 0.68
+    return 0.32 <= center_x <= 0.68 and 0.22 <= center_y <= 0.63
 
 
 def is_valid_tooth_box(box: dict, category: str = "condition", view_name: str = "upper") -> bool:
@@ -1098,27 +1196,151 @@ def _send_openrouter_chat_request(
     raise OpenRouterProviderError(f"OpenRouter provider error for '{model}'.")
 
 
-def analyze_with_openrouter(
+def compute_box_iou(box_a: dict, box_b: dict) -> float:
+    """Computes normalized Intersection over Union (IoU) for two {x, y, w, h} boxes."""
+    ax1, ay1 = float(box_a["x"]), float(box_a["y"])
+    ax2, ay2 = ax1 + float(box_a["w"]), ay1 + float(box_a["h"])
+    bx1, by1 = float(box_b["x"]), float(box_b["y"])
+    bx2, by2 = bx1 + float(box_b["w"]), by1 + float(box_b["h"])
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def map_crop_box_to_original(
+    box: dict,
+    crop_rect: tuple[float, float, float, float],
+) -> tuple[dict, list[int]]:
+    """Maps normalized [0, 1] crop coordinates back into full-image normalized [0, 1] and 0..1000 box_2d."""
+    cx0, cy0, cw, ch = crop_rect
+    ox = max(0.0, min(1.0, cx0 + float(box["x"]) * cw))
+    oy = max(0.0, min(1.0, cy0 + float(box["y"]) * ch))
+    ow = max(0.0, min(1.0 - ox, float(box["w"]) * cw))
+    oh = max(0.0, min(1.0 - oy, float(box["h"]) * ch))
+    mapped = {
+        "x": round(ox, 4),
+        "y": round(oy, 4),
+        "w": round(ow, 4),
+        "h": round(oh, 4),
+    }
+    raw_b2d = [
+        int(round(oy * 1000.0)),
+        int(round(ox * 1000.0)),
+        int(round((oy + oh) * 1000.0)),
+        int(round((ox + ow) * 1000.0)),
+    ]
+    return mapped, raw_b2d
+
+
+def _deduplicate_findings(findings: list[dict], iou_threshold: float = 0.42) -> list[dict]:
+    """Deduplicates overlapping findings of the same category across full-frame and regional crop passes."""
+    ranked = sorted(findings, key=lambda f: float(f.get("confidence", 0.0)), reverse=True)
+    kept: list[dict] = []
+    for cand in ranked:
+        c_cat = cand.get("category")
+        c_tooth = str(cand.get("tooth") or "").strip().lower()
+        c_name = str(cand.get("findingType") or cand.get("name") or "").strip().lower()
+        c_box = cand["box"]
+        is_dup = False
+        for existing in kept:
+            if existing.get("category") != c_cat:
+                continue
+            iou = compute_box_iou(existing["box"], c_box)
+            if iou >= iou_threshold:
+                is_dup = True
+                break
+            e_tooth = str(existing.get("tooth") or "").strip().lower()
+            e_name = str(existing.get("findingType") or existing.get("name") or "").strip().lower()
+            if c_tooth and e_tooth == c_tooth and c_name == e_name and iou >= 0.15:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(cand)
+    return kept
+
+
+def _nominal_crop_specs(view_name: str) -> list[tuple[str, tuple[float, float, float, float]]]:
+    v = view_name.lower()
+    if v == "lower":
+        return [
+            ("anterior", (0.14, 0.48, 0.72, 0.50)),
+            ("left_posterior", (0.0, 0.16, 0.46, 0.74)),
+            ("right_posterior", (0.54, 0.16, 0.46, 0.74)),
+        ]
+    if v == "upper":
+        return [
+            ("anterior", (0.14, 0.02, 0.72, 0.46)),
+            ("left_posterior", (0.0, 0.12, 0.46, 0.84)),
+            ("right_posterior", (0.54, 0.12, 0.46, 0.84)),
+        ]
+    return [
+        ("anterior_center", (0.18, 0.04, 0.64, 0.92)),
+        ("left_buccal", (0.0, 0.04, 0.50, 0.92)),
+        ("right_buccal", (0.50, 0.04, 0.50, 0.92)),
+    ]
+
+
+def generate_arch_crops(
     image_bytes: bytes,
+    mime_type: str,
     view_name: str,
-    api_key: str,
+) -> list[dict]:
+    """Creates overlapping regional crops covering posterior and anterior tooth bands without clipping crowns."""
+    crops: list[dict] = []
+    fmt = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}.get(mime_type, "JPEG")
+    with Image.open(BytesIO(image_bytes)) as img:
+        w, h = img.size
+        if w < 100 or h < 100:
+            return crops
+        for region_label, (nx, ny, nw, nh) in _nominal_crop_specs(view_name):
+            px0 = max(0, int(math.floor(nx * w)))
+            py0 = max(0, int(math.floor(ny * h)))
+            px1 = min(w, int(math.ceil((nx + nw) * w)))
+            py1 = min(h, int(math.ceil((ny + nh) * h)))
+            if px1 - px0 < 40 or py1 - py0 < 40:
+                continue
+            cropped = img.crop((px0, py0, px1, py1))
+            if fmt == "JPEG" and cropped.mode not in ("RGB", "L"):
+                cropped = cropped.convert("RGB")
+            buf = BytesIO()
+            save_kwargs = {"format": fmt}
+            if fmt in ("JPEG", "WEBP"):
+                save_kwargs["quality"] = 95
+                if fmt == "JPEG":
+                    save_kwargs["subsampling"] = 0
+            cropped.save(buf, **save_kwargs)
+            actual_rect = (
+                px0 / float(w),
+                py0 / float(h),
+                (px1 - px0) / float(w),
+                (py1 - py0) / float(h),
+            )
+            crops.append(
+                {
+                    "region": region_label,
+                    "rect": actual_rect,
+                    "bytes": buf.getvalue(),
+                }
+            )
+    return crops
+
+
+def _build_chat_payload(
+    prompt_text: str,
+    image_bytes: bytes,
+    mime_type: str,
     model: str,
-    base_url: str = DEFAULT_OPENROUTER_BASE_URL,
-    mime_type: str | None = None,
-    capabilities: dict | None = None,
+    caps: dict,
 ) -> dict:
-    """
-    Submits dental image bytes to OpenRouter Chat Completions API using multimodal image_url
-    content with base64 data URL and exact MIME type.
-    """
-    detected_mime = mime_type or detect_image_mime_type(image_bytes)
-    upright_bytes = normalize_image_orientation(image_bytes, detected_mime)
-    enamel_mask = compute_tooth_enamel_mask(upright_bytes)
-
-    b64_image = base64.b64encode(upright_bytes).decode("utf-8")
-    data_url = f"data:{detected_mime};base64,{b64_image}"
-    url = f"{base_url.rstrip('/')}/chat/completions"
-
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{mime_type};base64,{b64_image}"
     payload: dict = {
         "model": model,
         "temperature": 0.0,
@@ -1128,14 +1350,12 @@ def analyze_with_openrouter(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": build_view_prompt(view_name)},
+                    {"type": "text", "text": prompt_text},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             },
         ],
     }
-
-    caps = capabilities or {}
     if caps.get("structuredOutputSupported", True):
         payload["response_format"] = {
             "type": "json_schema",
@@ -1150,26 +1370,41 @@ def analyze_with_openrouter(
 
     if caps.get("supportsReasoning", "gemini-2.5" in model.lower() or "gemini-3" in model.lower()):
         payload["reasoning"] = {"max_tokens": 2048}
+    return payload
 
-    result = _send_openrouter_chat_request(url, payload, api_key, model, view_name)
-    text_content = _extract_openrouter_text(result, view_name)
-    parsed = _parse_json_response(text_content, view_name)
 
-    view_status = "assessed"
+def _parse_parsed_payload(parsed: dict | list, view_name: str) -> dict:
+    view_inconclusive = False
     inconclusive_reason: str | None = None
+    condition_status: str | None = None
+    alignment_status: str | None = None
+    visible_summary: str | None = None
+    unassessable_reason: str | None = None
     raw_conditions: list = []
     raw_alignment: list = []
 
     if isinstance(parsed, dict):
         raw_status = str(parsed.get("viewStatus") or "assessed").strip().lower()
         if raw_status == "inconclusive":
-            view_status = "inconclusive"
+            view_inconclusive = True
             reason = parsed.get("inconclusiveReason")
             inconclusive_reason = (
                 str(reason).strip()
                 if reason
                 else f"The {view_name} photo did not provide enough clarity for reliable inspection."
             )
+
+        cond_stat_val = parsed.get("conditionStatus")
+        if isinstance(cond_stat_val, str) and cond_stat_val.strip():
+            condition_status = cond_stat_val.strip().lower()
+        align_stat_val = parsed.get("alignmentStatus")
+        if isinstance(align_stat_val, str) and align_stat_val.strip():
+            alignment_status = align_stat_val.strip().lower()
+
+        if isinstance(parsed.get("visibleToothSummary"), str):
+            visible_summary = parsed["visibleToothSummary"].strip() or None
+        if isinstance(parsed.get("unassessableTeethReason"), str):
+            unassessable_reason = parsed["unassessableTeethReason"].strip() or None
 
         cond_val = parsed.get("toothConditions")
         align_val = parsed.get("dentalAlignment")
@@ -1194,9 +1429,68 @@ def analyze_with_openrouter(
             f"OpenRouter returned an unexpected JSON type for {view_name}."
         )
 
+    return {
+        "viewInconclusive": view_inconclusive,
+        "inconclusiveReason": inconclusive_reason,
+        "conditionStatus": condition_status,
+        "alignmentStatus": alignment_status,
+        "visibleToothSummary": visible_summary,
+        "unassessableTeethReason": unassessable_reason,
+        "rawConditions": raw_conditions,
+        "rawAlignment": raw_alignment,
+    }
+
+
+def _derive_module_status(
+    findings: list[dict],
+    reported_status: str | None,
+    view_inconclusive: bool,
+) -> str:
+    if findings:
+        return "assessed_with_findings"
+    if reported_status == "inconclusive" or (reported_status is None and view_inconclusive):
+        return "inconclusive"
+    return "assessed_no_findings"
+
+
+def analyze_with_openrouter(
+    image_bytes: bytes,
+    view_name: str,
+    api_key: str,
+    model: str,
+    base_url: str = DEFAULT_OPENROUTER_BASE_URL,
+    mime_type: str | None = None,
+    capabilities: dict | None = None,
+    enable_crop_fallback: bool = True,
+) -> dict:
+    """
+    Submits dental image bytes to OpenRouter Chat Completions API using multimodal image_url
+    content with base64 data URL and exact MIME type, with quality metrics and optional
+    overlapping regional crop refinement.
+    """
+    detected_mime = mime_type or detect_image_mime_type(image_bytes)
+    upright_bytes = normalize_image_orientation(image_bytes, detected_mime)
+    quality = assess_image_quality(upright_bytes)
+    enamel_mask = compute_tooth_enamel_mask(upright_bytes)
+
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    caps = capabilities or {}
+    payload = _build_chat_payload(
+        build_view_prompt(view_name, quality_context=quality),
+        upright_bytes,
+        detected_mime,
+        model,
+        caps,
+    )
+
+    result = _send_openrouter_chat_request(url, payload, api_key, model, view_name)
+    text_content = _extract_openrouter_text(result, view_name)
+    parsed = _parse_json_response(text_content, view_name)
+    extracted = _parse_parsed_payload(parsed, view_name)
+
     valid_conditions: list[dict] = []
     rejected_count = 0
-    for item in raw_conditions:
+    for item in extracted["rawConditions"]:
         norm = sanitize_and_normalize_finding(
             item,
             view_name,
@@ -1209,7 +1503,7 @@ def analyze_with_openrouter(
             rejected_count += 1
 
     valid_alignment: list[dict] = []
-    for item in raw_alignment:
+    for item in extracted["rawAlignment"]:
         norm = sanitize_and_normalize_finding(
             item,
             view_name,
@@ -1221,21 +1515,154 @@ def analyze_with_openrouter(
         else:
             rejected_count += 1
 
+    raw_conditions_count = len(extracted["rawConditions"])
+    raw_alignment_count = len(extracted["rawAlignment"])
+    ai_inconclusive = bool(extracted["viewInconclusive"])
+    reported_cond_status = extracted["conditionStatus"]
+    reported_align_status = extracted["alignmentStatus"]
+    inconclusive_reason = extracted["inconclusiveReason"]
+    crop_pass_used = False
+    crops_analyzed: list[str] = []
+
+    needs_crop_fallback = (
+        enable_crop_fallback
+        and quality.get("width", 0) >= 200
+        and quality.get("height", 0) >= 200
+        and quality.get("qualityStatus") != "too_small"
+        and (
+            (ai_inconclusive and quality.get("qualityStatus") in ("good", "soft_focus", "dark", "overexposed"))
+            or (rejected_count > 0 and not (valid_conditions or valid_alignment))
+            or (view_name.lower() == "lower" and (not valid_conditions or not valid_alignment))
+        )
+    )
+
+    if needs_crop_fallback:
+        crop_specs = generate_arch_crops(upright_bytes, detected_mime, view_name)
+        if crop_specs:
+            crop_pass_used = True
+            crop_non_inconclusive = 0
+            crop_cond_assessed = 0
+            crop_align_assessed = 0
+            for spec in crop_specs:
+                region = spec["region"]
+                crops_analyzed.append(region)
+                crop_payload = _build_chat_payload(
+                    build_crop_prompt(view_name, region),
+                    spec["bytes"],
+                    detected_mime,
+                    model,
+                    caps,
+                )
+                try:
+                    crop_res = _send_openrouter_chat_request(
+                        url,
+                        crop_payload,
+                        api_key,
+                        model,
+                        f"{view_name}:{region}",
+                    )
+                    crop_text = _extract_openrouter_text(crop_res, f"{view_name}:{region}")
+                    crop_parsed = _parse_json_response(crop_text, f"{view_name}:{region}")
+                    crop_ext = _parse_parsed_payload(crop_parsed, f"{view_name}:{region}")
+                except VisionClientError as exc:
+                    logger.warning("Crop pass %s:%s failed (%s); keeping full-frame findings.", view_name, region, exc)
+                    continue
+
+                if not crop_ext["viewInconclusive"]:
+                    crop_non_inconclusive += 1
+                if crop_ext["conditionStatus"] and crop_ext["conditionStatus"] != "inconclusive":
+                    crop_cond_assessed += 1
+                elif not crop_ext["viewInconclusive"]:
+                    crop_cond_assessed += 1
+                if crop_ext["alignmentStatus"] and crop_ext["alignmentStatus"] != "inconclusive":
+                    crop_align_assessed += 1
+                elif not crop_ext["viewInconclusive"]:
+                    crop_align_assessed += 1
+
+                for cat, raw_list, target_list in (
+                    ("condition", crop_ext["rawConditions"], valid_conditions),
+                    ("alignment", crop_ext["rawAlignment"], valid_alignment),
+                ):
+                    raw_conditions_count += len(raw_list) if cat == "condition" else 0
+                    raw_alignment_count += len(raw_list) if cat == "alignment" else 0
+                    for item in raw_list:
+                        if not isinstance(item, dict):
+                            rejected_count += 1
+                            continue
+                        local_box, _ = _parse_strict_box(item, category=cat, view_name=view_name)
+                        if local_box is None:
+                            rejected_count += 1
+                            continue
+                        orig_box, orig_b2d = map_crop_box_to_original(local_box, spec["rect"])
+                        remapped_item = dict(item)
+                        remapped_item.pop("boundingBox", None)
+                        remapped_item["box"] = orig_box
+                        remapped_item["box_2d"] = orig_b2d
+                        norm = sanitize_and_normalize_finding(
+                            remapped_item,
+                            view_name,
+                            category=cat,
+                            enamel_mask=enamel_mask,
+                        )
+                        if norm:
+                            target_list.append(norm)
+                        else:
+                            rejected_count += 1
+
+            valid_conditions = _deduplicate_findings(valid_conditions)
+            valid_alignment = _deduplicate_findings(valid_alignment)
+            if valid_conditions or valid_alignment or crop_non_inconclusive >= 2:
+                ai_inconclusive = False
+                inconclusive_reason = None
+            if crop_cond_assessed > 0 and reported_cond_status == "inconclusive":
+                reported_cond_status = "assessed_with_findings" if valid_conditions else "assessed_no_findings"
+            if crop_align_assessed > 0 and reported_align_status == "inconclusive":
+                reported_align_status = "assessed_with_findings" if valid_alignment else "assessed_no_findings"
+
+    condition_status = _derive_module_status(
+        valid_conditions,
+        reported_cond_status,
+        ai_inconclusive,
+    )
+    alignment_status = _derive_module_status(
+        valid_alignment,
+        reported_align_status,
+        ai_inconclusive,
+    )
+
     all_findings = valid_conditions + valid_alignment
 
-    if (len(raw_conditions) + len(raw_alignment)) > 0 and not all_findings and rejected_count > 0:
+    if all_findings:
+        explicit_view_status = "assessed_with_findings"
+        view_status = "assessed"
+        inconclusive_reason = None
+    elif ai_inconclusive and not crop_pass_used and (condition_status == "inconclusive" and alignment_status == "inconclusive"):
+        explicit_view_status = "inconclusive"
         view_status = "inconclusive"
-        if not inconclusive_reason:
-            inconclusive_reason = (
-                f"Model detections for the {view_name} view did not overlap visible tooth surfaces and were rejected."
-            )
+    elif condition_status == "inconclusive" and alignment_status == "inconclusive":
+        explicit_view_status = "inconclusive"
+        view_status = "inconclusive"
+    else:
+        explicit_view_status = "assessed_no_findings"
+        view_status = "assessed"
+        inconclusive_reason = None
 
     return {
         "viewStatus": view_status,
+        "explicitViewStatus": explicit_view_status,
+        "conditionStatus": condition_status,
+        "alignmentStatus": alignment_status,
         "inconclusiveReason": inconclusive_reason,
         "toothConditions": valid_conditions,
         "dentalAlignment": valid_alignment,
         "all": all_findings,
         "rejectedCount": rejected_count,
+        "rawConditionsCount": raw_conditions_count,
+        "rawAlignmentCount": raw_alignment_count,
+        "imageQuality": quality,
+        "visibleToothSummary": extracted["visibleToothSummary"],
+        "unassessableTeethReason": extracted["unassessableTeethReason"],
+        "cropPassUsed": crop_pass_used,
+        "cropsAnalyzed": crops_analyzed,
         "usage": result.get("usage", {}),
     }

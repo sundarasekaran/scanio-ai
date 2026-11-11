@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, model_validator
 
 Severity = Literal["low", "moderate", "high"]
 Category = Literal["condition", "alignment"]
+ModuleViewStatus = Literal["assessed_with_findings", "assessed_no_findings", "inconclusive"]
 
 
 class Box(BaseModel):
@@ -73,10 +74,44 @@ class ModulesSummary(BaseModel):
     dentalAlignment: dict[str, list[Finding]]
 
 
+class ModuleStatusesSummary(BaseModel):
+    toothConditions: dict[str, ModuleViewStatus]
+    dentalAlignment: dict[str, ModuleViewStatus]
+
+
+class ImageQualityReport(BaseModel):
+    width: int
+    height: int
+    aspectRatio: float
+    minDimension: int
+    laplacianVariance: float
+    edgeContrast: float
+    meanBrightness: float
+    qualityStatus: str
+    qualityNotes: str | None = None
+
+
+class ViewDiagnostic(BaseModel):
+    viewStatus: ModuleViewStatus
+    conditionStatus: ModuleViewStatus
+    alignmentStatus: ModuleViewStatus
+    visibleToothSummary: str | None = None
+    unassessableTeethReason: str | None = None
+    rawConditionsCount: int = 0
+    rawAlignmentCount: int = 0
+    rejectedCount: int = 0
+    cropPassUsed: bool = False
+    cropsAnalyzed: list[str] = Field(default_factory=list)
+
+
 class ScreeningResponse(BaseModel):
     overallScore: float = Field(ge=0, le=100)
     views: Views
     modules: ModulesSummary | None = None
+    viewStatuses: dict[str, ModuleViewStatus] | None = None
+    moduleStatuses: ModuleStatusesSummary | None = None
+    imageQuality: dict[str, ImageQualityReport] | None = None
+    viewDiagnostics: dict[str, ViewDiagnostic] | None = None
     screeningDisclaimer: str = (
         "AI-assisted screening only. This result is not a diagnosis and must be reviewed by a qualified dental professional."
     )

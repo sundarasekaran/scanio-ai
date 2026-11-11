@@ -9,6 +9,32 @@
 export type Severity = "low" | "moderate" | "high";
 export type ViewKey = "upper" | "lower" | "front";
 export type FindingCategory = "condition" | "alignment";
+export type ModuleViewStatus = "assessed_with_findings" | "assessed_no_findings" | "inconclusive";
+
+export interface ImageQualityReport {
+  width: number;
+  height: number;
+  aspectRatio: number;
+  minDimension: number;
+  laplacianVariance: number;
+  edgeContrast: number;
+  meanBrightness: number;
+  qualityStatus: string;
+  qualityNotes?: string | null | undefined;
+}
+
+export interface ViewDiagnostic {
+  viewStatus: ModuleViewStatus;
+  conditionStatus: ModuleViewStatus;
+  alignmentStatus: ModuleViewStatus;
+  visibleToothSummary?: string | null | undefined;
+  unassessableTeethReason?: string | null | undefined;
+  rawConditionsCount: number;
+  rawAlignmentCount: number;
+  rejectedCount: number;
+  cropPassUsed: boolean;
+  cropsAnalyzed: string[];
+}
 
 export const VIEWS: { key: ViewKey; label: string; hint: string }[] = [
   { key: "upper", label: "Upper arch", hint: "Tilt head back, open wide, photograph the top teeth (a mirror helps)." },
@@ -47,6 +73,13 @@ export interface PredictionResult {
     toothConditions: Record<ViewKey, DetectedCondition[]>;
     dentalAlignment: Record<ViewKey, DetectedCondition[]>;
   } | undefined;
+  viewStatuses?: Partial<Record<ViewKey, ModuleViewStatus>> | undefined;
+  moduleStatuses?: {
+    toothConditions?: Partial<Record<ViewKey, ModuleViewStatus>> | undefined;
+    dentalAlignment?: Partial<Record<ViewKey, ModuleViewStatus>> | undefined;
+  } | undefined;
+  imageQuality?: Partial<Record<ViewKey, ImageQualityReport>> | undefined;
+  viewDiagnostics?: Partial<Record<ViewKey, ViewDiagnostic>> | undefined;
   overallScore: number;
   isMock: boolean;
   screeningDisclaimer?: string | undefined;
@@ -377,9 +410,48 @@ export async function analyzeDentalImages(
       ? (rawReasons as Partial<Record<ViewKey, string>>)
       : undefined;
 
+  const isStatus = (v: unknown): v is ModuleViewStatus =>
+    v === "assessed_with_findings" || v === "assessed_no_findings" || v === "inconclusive";
+
+  const normalizeStatusMap = (obj: unknown): Partial<Record<ViewKey, ModuleViewStatus>> | undefined => {
+    if (!obj || typeof obj !== "object") return undefined;
+    const rec = obj as Record<string, unknown>;
+    const out: Partial<Record<ViewKey, ModuleViewStatus>> = {};
+    for (const k of ["upper", "lower", "front"] as const) {
+      if (isStatus(rec[k])) out[k] = rec[k];
+    }
+    return Object.keys(out).length ? out : undefined;
+  };
+
+  const viewStatuses = normalizeStatusMap(data["viewStatuses"]);
+  const rawModuleStatuses = data["moduleStatuses"] as Record<string, unknown> | undefined;
+  const moduleStatuses =
+    rawModuleStatuses && typeof rawModuleStatuses === "object"
+      ? {
+          toothConditions: normalizeStatusMap(rawModuleStatuses["toothConditions"]),
+          dentalAlignment: normalizeStatusMap(rawModuleStatuses["dentalAlignment"]),
+        }
+      : undefined;
+
+  const rawQuality = data["imageQuality"];
+  const imageQuality =
+    rawQuality && typeof rawQuality === "object"
+      ? (rawQuality as Partial<Record<ViewKey, ImageQualityReport>>)
+      : undefined;
+
+  const rawDiagnostics = data["viewDiagnostics"];
+  const viewDiagnostics =
+    rawDiagnostics && typeof rawDiagnostics === "object"
+      ? (rawDiagnostics as Partial<Record<ViewKey, ViewDiagnostic>>)
+      : undefined;
+
   return {
     views,
     modules,
+    viewStatuses,
+    moduleStatuses,
+    imageQuality,
+    viewDiagnostics,
     overallScore,
     isMock: false,
     screeningDisclaimer:

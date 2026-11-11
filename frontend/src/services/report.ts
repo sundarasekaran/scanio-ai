@@ -1,9 +1,27 @@
 import type { Screening } from "./store";
-import { VIEWS } from "./prediction";
+import { VIEWS, type ModuleViewStatus } from "./prediction";
 
 const colors = { low: "#16a34a", moderate: "#d97706", high: "#dc2626" };
 const esc = (str: string) =>
   str.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
+const statusLabel = (st: ModuleViewStatus) => {
+  if (st === "assessed_with_findings") return "Assessed — Findings Detected";
+  if (st === "inconclusive") return "Inconclusive";
+  return "Assessed — No Findings Detected";
+};
+
+const statusPillStyle = (st: ModuleViewStatus) => {
+  if (st === "assessed_with_findings") return "background:#fef3c7;color:#92400e;border:1px solid #fcd34d";
+  if (st === "inconclusive") return "background:#fee2e2;color:#991b1b;border:1px solid #fca5a5";
+  return "background:#d1fae5;color:#065f46;border:1px solid #6ee7b7";
+};
+
+const resolveStatus = (explicit: ModuleViewStatus | undefined, count: number, isInc: boolean): ModuleViewStatus => {
+  if (explicit) return explicit;
+  if (count > 0) return "assessed_with_findings";
+  return isInc ? "inconclusive" : "assessed_no_findings";
+};
 
 export function downloadReport(s: Screening, patient: string) {
   let globalIndex = 0;
@@ -17,6 +35,16 @@ export function downloadReport(s: Screening, patient: string) {
     const alignmentFindings = fullList.filter((c) => c.category === "alignment");
     const viewInconclusiveReason = s.inconclusiveReasons?.[v.key];
     const isViewInconclusive = Boolean(s.inconclusiveViews?.includes(v.key) || viewInconclusiveReason);
+    const condStatus = resolveStatus(s.moduleStatuses?.toothConditions?.[v.key], surfaceConditions.length, isViewInconclusive);
+    const alignStatus = resolveStatus(s.moduleStatuses?.dentalAlignment?.[v.key], alignmentFindings.length, isViewInconclusive);
+    const viewQuality = s.imageQuality?.[v.key];
+    const viewDiag = s.viewDiagnostics?.[v.key];
+    const qualityBadge = viewQuality
+      ? `<span style="margin-left:8px;font-size:11px;font-weight:500;color:#475569;background:#f1f5f9;padding:2px 8px;border-radius:999px">${viewQuality.width}&times;${viewQuality.height} &middot; ${esc(viewQuality.qualityStatus.replaceAll("_", " "))}</span>`
+      : "";
+    const visibilityNote = viewDiag?.unassessableTeethReason
+      ? `<p style="font-size:12px;color:#475569;background:#f8fafc;border:1px solid #e2e8f0;padding:8px 10px;border-radius:8px;margin-top:8px"><b>Visibility note:</b> ${esc(viewDiag.unassessableTeethReason)}</p>`
+      : "";
 
     // Overlays for image
     const boxes = fullList
@@ -34,41 +62,42 @@ export function downloadReport(s: Screening, patient: string) {
       surfaceConditions
         .map((c) => {
           const idx = viewOffset + fullList.indexOf(c) + 1;
-          const toothStr = c.tooth ? `Tooth ${c.tooth}` : "—";
-          return `<tr><td>#${idx}</td><td><b>${c.name}</b></td><td>${toothStr}</td><td>${Math.round(c.confidence * 100)}%</td><td>${c.severity}</td><td>${c.description}</td><td>${c.recommendation}</td></tr>`;
+          const toothStr = c.tooth ? `Tooth ${esc(c.tooth)}` : "—";
+          return `<tr><td>#${idx}</td><td><b>${esc(c.name)}</b></td><td>${toothStr}</td><td>${Math.round(c.confidence * 100)}%</td><td>${esc(c.severity)}</td><td>${esc(c.description)}</td><td>${esc(c.recommendation)}</td></tr>`;
         })
-        .join("") || (isViewInconclusive
+        .join("") || (condStatus === "inconclusive"
           ? `<tr><td colspan="7" style="color:#92400e;background:#fffbeb">${esc(viewInconclusiveReason || "Inconclusive image: unable to reliably inspect tooth surfaces.")}</td></tr>`
-          : `<tr><td colspan="7" style="color:#059669;background:#ecfdf5">No tooth surface concerns detected in this view.</td></tr>`);
+          : `<tr><td colspan="7" style="color:#059669;background:#ecfdf5">Assessed — No tooth surface concerns detected in visible enamel.</td></tr>`);
 
     // Section B table rows
     const alignmentRows =
       alignmentFindings
         .map((c) => {
           const idx = viewOffset + fullList.indexOf(c) + 1;
-          const teethStr = c.tooth ? `Teeth: ${c.tooth}` : "—";
-          const gapStr = c.gapMeasurement ? `<br><small style="color:#4338ca"><b>Gap:</b> ${c.gapMeasurement}</small>` : "";
-          return `<tr><td>#${idx}</td><td><b>${c.name}</b>${gapStr}</td><td>${teethStr}</td><td>${Math.round(c.confidence * 100)}%</td><td>${c.severity}</td><td>${c.description}</td><td>${c.recommendation}</td></tr>`;
+          const teethStr = c.tooth ? `Teeth: ${esc(c.tooth)}` : "—";
+          const gapStr = c.gapMeasurement ? `<br><small style="color:#4338ca"><b>Observation:</b> ${esc(c.gapMeasurement)}</small>` : "";
+          return `<tr><td>#${idx}</td><td><b>${esc(c.name)}</b>${gapStr}</td><td>${teethStr}</td><td>${Math.round(c.confidence * 100)}%</td><td>${esc(c.severity)}</td><td>${esc(c.description)}</td><td>${esc(c.recommendation)}</td></tr>`;
         })
-        .join("") || (isViewInconclusive
+        .join("") || (alignStatus === "inconclusive"
           ? `<tr><td colspan="7" style="color:#92400e;background:#fffbeb">${esc(viewInconclusiveReason || "Inconclusive image: unable to reliably inspect dental alignment.")}</td></tr>`
-          : `<tr><td colspan="7" style="color:#4338ca;background:#eef2ff">No dental alignment or arch irregularities detected in this view.</td></tr>`);
+          : `<tr><td colspan="7" style="color:#4338ca;background:#eef2ff">Assessed — No dental alignment or arch irregularities detected in visible teeth.</td></tr>`);
 
     return `
 <div class="view-block">
-  <h2>${v.label}</h2>
+  <h2>${esc(v.label)}${qualityBadge}</h2>
   <div style="position:relative;display:inline-block;max-width:440px;margin-bottom:16px">
-    <img src="${s.images[v.key]}" style="width:100%;display:block;border-radius:12px;border:1px solid #cbd5e1" alt="${v.label}"/>
+    <img src="${s.images[v.key]}" style="width:100%;display:block;border-radius:12px;border:1px solid #cbd5e1" alt="${esc(v.label)}"/>
     ${boxes}
   </div>
+  ${visibilityNote}
 
-  <h3 class="sec-title sec-a">Section A: Tooth-Surface Condition Findings (Module 1)</h3>
+  <h3 class="sec-title sec-a">Section A: Tooth-Surface Condition Findings (Module 1) <span style="float:right;font-size:11px;padding:1px 8px;border-radius:999px;${statusPillStyle(condStatus)}">${statusLabel(condStatus)}</span></h3>
   <table>
     <thead><tr><th>#</th><th>Condition</th><th>Tooth</th><th>Confidence</th><th>Severity</th><th>Description</th><th>Recommendation</th></tr></thead>
     <tbody>${conditionRows}</tbody>
   </table>
 
-  <h3 class="sec-title sec-b">Section B: Dental Alignment Analysis (Module 2)</h3>
+  <h3 class="sec-title sec-b">Section B: Dental Alignment Analysis (Module 2) <span style="float:right;font-size:11px;padding:1px 8px;border-radius:999px;${statusPillStyle(alignStatus)}">${statusLabel(alignStatus)}</span></h3>
   <table>
     <thead><tr><th>#</th><th>Alignment Observation</th><th>Involved Teeth</th><th>Confidence</th><th>Severity</th><th>Description</th><th>Orthodontic Recommendation</th></tr></thead>
     <tbody>${alignmentRows}</tbody>

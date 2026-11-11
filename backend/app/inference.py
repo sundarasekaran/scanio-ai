@@ -20,6 +20,7 @@ from app.vision_client import (
     OpenRouterTimeoutError,
     VisionClientError,
     analyze_with_openrouter,
+    assess_image_quality,
     get_openrouter_config,
     sanitize_secret,
     verify_openrouter_model_availability,
@@ -176,19 +177,67 @@ def run_screening(images: dict[str, bytes]) -> dict:
 
     inconclusive_views: list[str] = []
     inconclusive_reasons: dict[str, str] = {}
+    view_statuses: dict[str, str] = {}
+    condition_statuses: dict[str, str] = {}
+    alignment_statuses: dict[str, str] = {}
+    image_quality_map: dict[str, dict] = {}
+    view_diagnostics: dict[str, dict] = {}
     rejected_total = 0
 
     for view in views_order:
         res = view_results[view]
-        rejected_total += int(res.get("rejectedCount", 0) or 0)
-        if res.get("viewStatus") == "inconclusive":
+        cond_list = res.get("toothConditions", [])
+        align_list = res.get("dentalAlignment", [])
+        rejected_count = int(res.get("rejectedCount", 0) or 0)
+        rejected_total += rejected_count
+
+        is_inc = res.get("viewStatus") == "inconclusive" or res.get("explicitViewStatus") == "inconclusive"
+        cond_status = res.get("conditionStatus") or (
+            "assessed_with_findings"
+            if cond_list
+            else ("inconclusive" if is_inc else "assessed_no_findings")
+        )
+        align_status = res.get("alignmentStatus") or (
+            "assessed_with_findings"
+            if align_list
+            else ("inconclusive" if is_inc else "assessed_no_findings")
+        )
+        explicit_status = res.get("explicitViewStatus") or (
+            "assessed_with_findings"
+            if (cond_list or align_list)
+            else ("inconclusive" if (is_inc or (cond_status == "inconclusive" and align_status == "inconclusive")) else "assessed_no_findings")
+        )
+
+        view_statuses[view] = explicit_status
+        condition_statuses[view] = cond_status
+        alignment_statuses[view] = align_status
+
+        q_info = res.get("imageQuality") or assess_image_quality(images[view])
+        image_quality_map[view] = q_info
+
+        view_diagnostics[view] = {
+            "viewStatus": explicit_status,
+            "conditionStatus": cond_status,
+            "alignmentStatus": align_status,
+            "visibleToothSummary": res.get("visibleToothSummary"),
+            "unassessableTeethReason": res.get("unassessableTeethReason"),
+            "rawConditionsCount": int(res.get("rawConditionsCount", len(cond_list)) or 0),
+            "rawAlignmentCount": int(res.get("rawAlignmentCount", len(align_list)) or 0),
+            "rejectedCount": rejected_count,
+            "cropPassUsed": bool(res.get("cropPassUsed", False)),
+            "cropsAnalyzed": list(res.get("cropsAnalyzed") or []),
+        }
+
+        if explicit_status == "inconclusive" or cond_status == "inconclusive" or align_status == "inconclusive":
             inconclusive_views.append(view)
             inconclusive_reasons[view] = (
                 res.get("inconclusiveReason")
-                or f"The {view} image could not be reliably evaluated."
+                or f"The {view} image could not be reliably evaluated for all modules."
             )
 
-    all_inconclusive = len(inconclusive_views) == len(views_order)
+    all_inconclusive = (
+        sum(1 for v in views_order if view_statuses[v] == "inconclusive") == len(views_order)
+    )
     is_inconclusive = len(inconclusive_views) > 0
 
     if all_inconclusive:
@@ -235,6 +284,13 @@ def run_screening(images: dict[str, bytes]) -> dict:
                 "front": front_res.get("dentalAlignment", []),
             },
         },
+        "viewStatuses": view_statuses,
+        "moduleStatuses": {
+            "toothConditions": condition_statuses,
+            "dentalAlignment": alignment_statuses,
+        },
+        "imageQuality": image_quality_map,
+        "viewDiagnostics": view_diagnostics,
         "screeningDisclaimer": (
             f"AI-assisted preliminary screening via OpenRouter ({model}). "
             "Separates Tooth-Surface Conditions (Module 1) and Dental Alignment (Module 2). "
