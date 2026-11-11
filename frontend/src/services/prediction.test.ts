@@ -111,12 +111,13 @@ describe("prediction service", () => {
 
   it("provides status-specific fallback messages when backend error body has no detail", async () => {
     const cases: Array<[number, RegExp]> = [
-      [401, /Invalid OpenRouter API key/],
-      [402, /insufficient credits/],
+      [401, /Invalid vision API key/],
+      [402, /insufficient credits or quota/],
       [403, /permission restriction/],
-      [404, /OPENROUTER_MODEL/],
+      [404, /NVIDIA_MODEL/],
       [429, /rate limit exceeded/],
       [502, /malformed or upstream error/],
+      [503, /NVIDIA_API_KEY/],
     ];
     for (const [status, expected] of cases) {
       vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status })));

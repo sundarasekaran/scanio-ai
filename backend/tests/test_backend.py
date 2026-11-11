@@ -23,6 +23,7 @@ from app.vision_client import (
     OpenRouterUnsupportedImageError,
     _extract_openrouter_text,
     _parse_json_response,
+    analyze_with_nvidia,
     analyze_with_openrouter,
     assess_image_quality,
     compute_tooth_enamel_mask,
@@ -30,12 +31,15 @@ from app.vision_client import (
     generate_arch_crops,
     is_in_lower_tongue_exclusion_zone,
     is_in_palatal_exclusion_zone,
+    is_nvidia_vision_model,
     is_valid_tooth_box,
     load_backend_env,
     map_crop_box_to_original,
     normalize_image_orientation,
+    prepare_image_for_provider,
     sanitize_and_normalize_finding,
     sanitize_secret,
+    verify_nvidia_model_availability,
     verify_openrouter_model_availability,
 )
 
@@ -58,7 +62,7 @@ class BackendTestCase(unittest.TestCase):
         self.assertEqual(data["status"], "ok")
         self.assertIn("Scanio", data["service"])
 
-    @patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-v1-test-key"})
+    @patch.dict("os.environ", {"VISION_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-v1-test-key"})
     @patch("app.inference.verify_openrouter_model_availability")
     def test_model_status_endpoint_openrouter(self, mock_verify):
         mock_verify.return_value = {
@@ -339,12 +343,17 @@ class BackendTestCase(unittest.TestCase):
         self.assertEqual(parsed["viewStatus"], "assessed")
 
     def test_secret_sanitization(self):
-        fake_key = "sk-or-v1-1234567890abcdef1234567890abcdef"
-        msg = f"Authorization: Bearer {fake_key} failed for {fake_key}"
-        cleaned = sanitize_secret(msg, fake_key)
-        self.assertNotIn(fake_key, cleaned)
+        fake_or = "sk-or-v1-1234567890abcdef1234567890abcdef"
+        fake_nv = "nvapi-1234567890abcdef1234567890abcdef"
+        msg = f"Authorization: Bearer {fake_nv} failed alongside {fake_or}"
+        cleaned = sanitize_secret(msg, fake_nv)
+        self.assertNotIn(fake_nv, cleaned)
+        self.assertNotIn(fake_or, cleaned)
 
-    @patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-v1-test-key"})
+    @patch.dict(
+        "os.environ",
+        {"VISION_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-v1-test-key"},
+    )
     def test_env_loader(self):
         cfg = load_backend_env()
         self.assertEqual(cfg["provider"], "openrouter")
@@ -352,7 +361,181 @@ class BackendTestCase(unittest.TestCase):
         self.assertEqual(cfg["base_url"], "https://openrouter.ai/api/v1")
         self.assertTrue(cfg["has_key"])
 
-    @patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-v1-test-key"})
+    @patch.dict(
+        "os.environ",
+        {
+            "VISION_PROVIDER": "nvidia",
+            "NVIDIA_API_KEY": "nvapi-test-key",
+            "NVIDIA_MODEL": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+            "NVIDIA_BASE_URL": "https://integrate.api.nvidia.com/v1",
+        },
+        clear=False,
+    )
+    def test_env_loader_nvidia_and_stale_provider_migration(self):
+        cfg = load_backend_env()
+        self.assertEqual(cfg["provider"], "nvidia")
+        self.assertEqual(cfg["model"], "nvidia/nemotron-3.5-super-vl-120b-a12b")
+        self.assertEqual(cfg["base_url"], "https://integrate.api.nvidia.com/v1")
+        self.assertTrue(cfg["has_key"])
+
+        with patch.dict(
+            "os.environ",
+            {
+                "VISION_PROVIDER": "openrouter",
+                "OPENROUTER_API_KEY": "nvapi-misplaced",
+                "NVIDIA_API_KEY": "nvapi-real-env-key",
+            },
+        ):
+            migrated = load_backend_env()
+            self.assertEqual(migrated["provider"], "nvidia")
+            self.assertEqual(migrated["api_key"], "nvapi-real-env-key")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "VISION_PROVIDER": "nvidia",
+            "NVIDIA_API_KEY": "nvapi-secret-unit-test-key",
+            "NVIDIA_MODEL": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+            "NVIDIA_BASE_URL": "https://integrate.api.nvidia.com/v1",
+        },
+    )
+    @patch("app.inference.verify_nvidia_model_availability")
+    def test_model_status_endpoint_nvidia(self, mock_verify):
+        mock_verify.return_value = {
+            "valid": True,
+            "status": "available",
+            "displayName": "NVIDIA Nemotron 3.5 Super VL 120B",
+            "visionSupported": True,
+            "structuredOutputSupported": True,
+        }
+        resp = self.client.get("/api/v1/model-status")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["vision_provider"], "nvidia")
+        self.assertEqual(data["selected_model"], "nvidia/nemotron-3.5-super-vl-120b-a12b")
+        self.assertEqual(data["base_url"], "https://integrate.api.nvidia.com/v1")
+        self.assertTrue(data["api_key_configured"])
+        self.assertTrue(data["screening_ready"])
+        self.assertTrue(data["vision_supported"])
+        self.assertNotIn("nvapi-secret-unit-test-key", json.dumps(data))
+
+    @patch("app.vision_client._fetch_nvidia_catalog")
+    def test_verify_nvidia_catalog_and_vision_support(self, mock_catalog):
+        mock_catalog.return_value = [
+            {"id": "nvidia/nemotron-3.5-super-vl-120b-a12b"},
+            {"id": "google/gemma-4-31b-it"},
+            {"id": "nvidia/llama-3.1-nemotron-70b-instruct"},
+        ]
+        self.assertTrue(is_nvidia_vision_model("nvidia/nemotron-3.5-super-vl-120b-a12b"))
+        self.assertTrue(is_nvidia_vision_model("google/gemma-4-31b-it"))
+        self.assertFalse(is_nvidia_vision_model("nvidia/llama-3.1-nemotron-70b-instruct"))
+
+        ok = verify_nvidia_model_availability("nvapi-test", "nvidia/nemotron-3.5-super-vl-120b-a12b", run_auth_probe=False)
+        self.assertTrue(ok["valid"])
+        self.assertTrue(ok["visionSupported"])
+
+        text_only = verify_nvidia_model_availability("nvapi-test", "nvidia/llama-3.1-nemotron-70b-instruct", run_auth_probe=False)
+        self.assertFalse(text_only["valid"])
+        self.assertEqual(text_only["status"], "unsupported_vision")
+
+        missing = verify_nvidia_model_availability("nvapi-test", "nvidia/unknown-model", run_auth_probe=False)
+        self.assertFalse(missing["valid"])
+        self.assertEqual(missing["status"], "model_not_found")
+
+    @patch("app.vision_client.urllib.request.urlopen")
+    def test_analyze_with_nvidia_multimodal_payload_and_fallback(self, mock_urlopen):
+        # First request simulates 400 on json_schema, second returns valid dental findings
+        err_400 = __import__("urllib.error").error.HTTPError(
+            "https://integrate.api.nvidia.com/v1/chat/completions",
+            400,
+            "Bad Request",
+            {},
+            BytesIO(b'{"error":{"message":"json_schema not supported by runtime"}}'),
+        )
+        ok_resp = MagicMock()
+        ok_resp.__enter__.return_value = ok_resp
+        ok_resp.read.return_value = json.dumps(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "viewStatus": "assessed",
+                                    "conditionStatus": "assessed_with_findings",
+                                    "alignmentStatus": "assessed_no_findings",
+                                    "visibleToothSummary": "Mandibular molars visible",
+                                    "unassessableTeethReason": None,
+                                    "toothConditions": [
+                                        {
+                                            "toothNumber": "36",
+                                            "condition": "Visible Plaque",
+                                            "affectedRegion": "occlusal",
+                                            "confidence": 0.86,
+                                            "severity": "low",
+                                            "description": "Mild plaque on lower molar occlusal surface.",
+                                            "recommendation": "Brush and floss carefully.",
+                                            "box_2d": [500, 800, 620, 900],
+                                        }
+                                    ],
+                                    "dentalAlignment": [],
+                                }
+                            )
+                        },
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        mock_urlopen.side_effect = [err_400, ok_resp]
+
+        webp_bytes = _make_image_bytes("WEBP")
+        res = analyze_with_nvidia(
+            webp_bytes,
+            "lower",
+            "nvapi-test-secret",
+            "google/gemma-4-31b-it",
+            "https://integrate.api.nvidia.com/v1",
+            capabilities={"structuredOutputSupported": True},
+            enable_crop_fallback=False,
+        )
+        self.assertEqual(res["viewStatus"], "assessed")
+        self.assertEqual(len(res["toothConditions"]), 1)
+        self.assertEqual(res["toothConditions"][0]["tooth"], "36")
+        second_req = mock_urlopen.call_args_list[1].args[0]
+        self.assertEqual(second_req.full_url, "https://integrate.api.nvidia.com/v1/chat/completions")
+        self.assertEqual(second_req.get_header("Authorization"), "Bearer nvapi-test-secret")
+        sent_body = json.loads(second_req.data.decode("utf-8"))
+        self.assertEqual(sent_body["response_format"], {"type": "json_object"})
+        self.assertTrue(sent_body["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/webp;base64,"))
+
+    def test_prepare_image_for_nvidia_size_limit(self):
+        small = _make_image_bytes("PNG")
+        out_small, mime_small = prepare_image_for_provider(small, "image/png", provider="nvidia")
+        self.assertEqual(mime_small, "image/png")
+        self.assertEqual(out_small, small)
+
+        # Build noisy 1800x1400 PNG well over 145KB -> verifies clean aspect-preserving shrinkage
+        im = Image.new("RGB", (1800, 1400))
+        pixels = []
+        for y in range(1400):
+            for x in range(1800):
+                pixels.append(((x * 37 + y * 13) % 255, (x * 17 + y * 53) % 255, (x * 7 + y * 29) % 255))
+        im.putdata(pixels)
+        big_buf = BytesIO()
+        im.save(big_buf, format="PNG")
+        raw_big = big_buf.getvalue()
+        self.assertGreater(len(raw_big), 145_000)
+
+        fitted, out_mime = prepare_image_for_provider(raw_big, "image/png", provider="nvidia")
+        self.assertLessEqual(len(fitted), 145_000)
+        with Image.open(BytesIO(fitted)) as out_im:
+            orig_ratio = 1800 / 1400
+            new_ratio = out_im.size[0] / out_im.size[1]
+            self.assertAlmostEqual(orig_ratio, new_ratio, delta=0.03)
+        self.assertIn(out_mime, ("image/png", "image/jpeg"))
+
+    @patch.dict("os.environ", {"VISION_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-v1-test-key"})
     @patch("app.inference.verify_openrouter_model_availability")
     @patch("app.inference.analyze_with_openrouter")
     def test_predict_endpoint_success(self, mock_analyze, mock_verify):
@@ -446,7 +629,7 @@ class BackendTestCase(unittest.TestCase):
         self.assertEqual(len(data["modules"]["dentalAlignment"]["upper"]), 1)
         self.assertIn("OpenRouter", data["screeningDisclaimer"])
 
-    @patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-v1-test-key"})
+    @patch.dict("os.environ", {"VISION_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-v1-test-key"})
     @patch("app.inference.verify_openrouter_model_availability")
     @patch("app.inference.analyze_with_openrouter")
     def test_predict_endpoint_inconclusive_all_views(self, mock_analyze, mock_verify):
@@ -643,7 +826,7 @@ class BackendTestCase(unittest.TestCase):
         self.assertGreater(box["y"], 0.70)
         self.assertEqual(res["unassessableTeethReason"], "Third molars out of frame")
 
-    @patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-v1-test-key"})
+    @patch.dict("os.environ", {"VISION_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-v1-test-key"})
     @patch("app.inference.verify_openrouter_model_availability")
     @patch("app.inference.analyze_with_openrouter")
     def test_predict_returns_explicit_per_module_view_statuses(self, mock_analyze, mock_verify):

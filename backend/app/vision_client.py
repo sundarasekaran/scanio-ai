@@ -1,16 +1,16 @@
 """
-OpenRouter Vision AI Client for Scanio AI Dental Screening.
+Multimodal Vision AI Client for Scanio AI Dental Screening (NVIDIA NIM & OpenRouter).
 
 Supports TWO independent screening modules:
-1. TOOTH-SURFACE CONDITION ANALYSIS (enamel cavities, discoloration, cracks, plaque, tartar/calculus)
+1. TOOTH-SURFACE CONDITION ANALYSIS (enamel caries, discoloration, cracks, plaque, tartar/calculus)
 2. DENTAL ALIGNMENT ANALYSIS (diastema/gaps, crowding, rotation, displacement, arch form)
 
 Enforces:
-- OpenRouter Chat Completions API (POST {OPENROUTER_BASE_URL}/chat/completions) with Bearer auth.
-- OpenRouter key & model catalog verification (existence, vision/image input, structured JSON support).
-- Multimodal image_url payload with base64 data URL and exact detected MIME type.
+- NVIDIA NIM API Catalog (`POST {NVIDIA_BASE_URL}/chat/completions`) and OpenRouter Chat Completions API.
+- Key & vision-model capability verification (catalog presence, multimodal vision support).
+- Multimodal image_url payload with base64 data URL and preserved MIME type (JPEG, PNG, WEBP).
 - Native spatial box_2d ([ymin, xmin, ymax, xmax] 0..1000) coordinate validation without clamping/shifting.
-- EXIF orientation normalization & pixel-level tooth-enamel overlap validation.
+- EXIF orientation normalization, quality assessment, regional crop recovery, & enamel validation.
 - Strict API key sanitization (keys are never logged or returned to clients).
 - Zero mock or heuristic fallback.
 """
@@ -18,6 +18,7 @@ from io import BytesIO
 from pathlib import Path
 from PIL import Image, ImageFilter, ImageOps, ImageStat, UnidentifiedImageError
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -31,13 +32,87 @@ from dotenv import load_dotenv
 
 from app.prompts import DENTAL_SYSTEM_PROMPT, build_crop_prompt, build_view_prompt
 
-logger = logging.getLogger("scanio.openrouter")
+logger = logging.getLogger("scanio.vision")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 ENV_FILE_PATH = BASE_DIR / ".env"
 
+DEFAULT_VISION_PROVIDER = "nvidia"
+DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b"
+DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+NVIDIA_INLINE_RAW_LIMIT_BYTES = 145_000
+NVIDIA_AUTH_PROBE_TTL_SEC = 300
+_NVIDIA_AUTH_CACHE: dict[str, tuple[float, dict]] = {}
+
+NVIDIA_VISION_MODELS: dict[str, dict] = {
+    "nvidia/nemotron-3.5-super-vl-120b-a12b": {
+        "displayName": "NVIDIA Nemotron 3.5 Super VL 120B",
+        "supportsStructured": True,
+        "supportsResponseFormat": True,
+    },
+    "google/gemma-4-31b-it": {
+        "displayName": "Google Gemma 4 31B IT",
+        "supportsStructured": False,
+        "supportsResponseFormat": True,
+    },
+    "google/gemma-3-12b-it": {
+        "displayName": "Google Gemma 3 12B IT",
+        "supportsStructured": False,
+        "supportsResponseFormat": True,
+    },
+    "google/gemma-3-4b-it": {
+        "displayName": "Google Gemma 3 4B IT",
+        "supportsStructured": False,
+        "supportsResponseFormat": True,
+    },
+    "meta/llama-3.2-90b-vision-instruct": {
+        "displayName": "Meta Llama 3.2 90B Vision Instruct",
+        "supportsStructured": False,
+        "supportsResponseFormat": True,
+    },
+    "meta/llama-3.2-11b-vision-instruct": {
+        "displayName": "Meta Llama 3.2 11B Vision Instruct",
+        "supportsStructured": False,
+        "supportsResponseFormat": True,
+    },
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+        "displayName": "NVIDIA Nemotron 3 Nano Omni 30B",
+        "supportsStructured": False,
+        "supportsResponseFormat": True,
+    },
+    "nvidia/cosmos-reason2-8b": {
+        "displayName": "NVIDIA Cosmos Reason 2 8B",
+        "supportsStructured": False,
+        "supportsResponseFormat": True,
+    },
+    "microsoft/phi-3-vision-128k-instruct": {
+        "displayName": "Microsoft Phi-3 Vision 128K Instruct",
+        "supportsStructured": False,
+        "supportsResponseFormat": False,
+    },
+    "microsoft/phi-4-multimodal-instruct": {
+        "displayName": "Microsoft Phi-4 Multimodal Instruct",
+        "supportsStructured": False,
+        "supportsResponseFormat": False,
+    },
+    "nvidia/neva-22b": {
+        "displayName": "NVIDIA NeVA 22B",
+        "supportsStructured": False,
+        "supportsResponseFormat": False,
+    },
+    "nvidia/vila": {
+        "displayName": "NVIDIA VILA",
+        "supportsStructured": False,
+        "supportsResponseFormat": False,
+    },
+    "adept/fuyu-8b": {
+        "displayName": "Adept Fuyu 8B",
+        "supportsStructured": False,
+        "supportsResponseFormat": False,
+    },
+}
 
 MAX_TOOTH_BOX_WIDTH = 0.35
 MAX_TOOTH_BOX_HEIGHT = 0.35
@@ -232,6 +307,7 @@ def sanitize_secret(text: str, secret: str = "") -> str:
     clean = str(text)
     if secret and secret in clean:
         clean = clean.replace(secret, "[REDACTED_API_KEY]")
+    clean = re.sub(r"nvapi-[0-9A-Za-z\-_]+", "[REDACTED_NVIDIA_KEY]", clean)
     clean = re.sub(r"sk-or-v1-[0-9A-Za-z\-_]+", "[REDACTED_OPENROUTER_KEY]", clean)
     clean = re.sub(r"Bearer\s+\S+", "Bearer [REDACTED]", clean, flags=re.IGNORECASE)
     clean = re.sub(r"key=AIza[0-9A-Za-z\-_]{35}", "key=[REDACTED]", clean)
@@ -240,43 +316,72 @@ def sanitize_secret(text: str, secret: str = "") -> str:
     return clean
 
 
+def _read_env_file_vars() -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not ENV_FILE_PATH.is_file():
+        return values
+    try:
+        load_dotenv(ENV_FILE_PATH, override=True)
+        for raw_line in ENV_FILE_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            values[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception as exc:
+        logger.warning("Error reading .env file at %s: %s", ENV_FILE_PATH, exc)
+    return values
+
+
 def load_backend_env() -> dict:
-    """Loads OpenRouter backend environment from backend .env independently of CWD."""
-    provider = "openrouter"
-    model = DEFAULT_OPENROUTER_MODEL
-    base_url = DEFAULT_OPENROUTER_BASE_URL
-    file_key = ""
+    """Loads NVIDIA / OpenRouter vision backend configuration independently of CWD."""
+    file_vars = _read_env_file_vars()
 
-    if ENV_FILE_PATH.is_file():
-        try:
-            load_dotenv(ENV_FILE_PATH, override=True)
-            content = ENV_FILE_PATH.read_text(encoding="utf-8")
-            for line in content.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip('"').strip("'")
-                if k == "VISION_PROVIDER" and v:
-                    provider = v.lower()
-                elif k == "OPENROUTER_MODEL" and v:
-                    model = v
-                elif k == "OPENROUTER_BASE_URL" and v:
-                    base_url = v.rstrip("/")
-                elif k == "OPENROUTER_API_KEY" and v:
-                    file_key = v
-        except Exception as exc:
-            logger.warning("Error reading .env file at %s: %s", ENV_FILE_PATH, exc)
+    def _pick(key: str, default: str = "") -> str:
+        val = file_vars.get(key) or os.environ.get(key, "")
+        return val.strip().strip('"').strip("'") or default
 
-    env_key = os.environ.get("OPENROUTER_API_KEY", "").strip().strip('"').strip("'")
-    effective_key = file_key or env_key
+    raw_provider = _pick("VISION_PROVIDER", "").lower()
+    nv_key = _pick("NVIDIA_API_KEY", "")
+    nv_model = _pick("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL)
+    nv_base_url = _pick("NVIDIA_BASE_URL", DEFAULT_NVIDIA_BASE_URL).rstrip("/")
+
+    or_key = _pick("OPENROUTER_API_KEY", "")
+    or_model = _pick("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
+    or_base_url = _pick("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL).rstrip("/")
+
+    # Default to NVIDIA; also migrate stale VISION_PROVIDER=openrouter cleanly when NVIDIA_API_KEY
+    # is present without a valid OpenRouter key.
+    if raw_provider == "openrouter":
+        if nv_key and (not or_key or or_key.startswith("nvapi-")):
+            provider = "nvidia"
+        else:
+            provider = "openrouter"
+    elif raw_provider:
+        provider = raw_provider
+    elif nv_key or not or_key:
+        provider = DEFAULT_VISION_PROVIDER
+    else:
+        provider = "openrouter"
+
+    if provider == "nvidia":
+        effective_key = nv_key
+        model = nv_model
+        base_url = nv_base_url
+    else:
+        effective_key = or_key
+        model = or_model
+        base_url = or_base_url
 
     os.environ["VISION_PROVIDER"] = provider
-    os.environ["OPENROUTER_MODEL"] = model
-    os.environ["OPENROUTER_BASE_URL"] = base_url
-    if effective_key:
-        os.environ["OPENROUTER_API_KEY"] = effective_key
+    if nv_key:
+        os.environ["NVIDIA_API_KEY"] = nv_key
+    os.environ["NVIDIA_MODEL"] = nv_model
+    os.environ["NVIDIA_BASE_URL"] = nv_base_url
+    os.environ["OPENROUTER_MODEL"] = or_model
+    os.environ["OPENROUTER_BASE_URL"] = or_base_url
+    if or_key:
+        os.environ["OPENROUTER_API_KEY"] = or_key
 
     return {
         "provider": provider,
@@ -284,9 +389,15 @@ def load_backend_env() -> dict:
         "base_url": base_url,
         "api_key": effective_key,
         "has_key": bool(effective_key),
+        "nvidia_configured": bool(nv_key),
+        "openrouter_configured": bool(or_key),
         "env_path": str(ENV_FILE_PATH),
         "env_exists": ENV_FILE_PATH.is_file(),
     }
+
+
+def get_vision_config() -> dict:
+    return load_backend_env()
 
 
 def get_openrouter_config() -> dict:
@@ -302,14 +413,70 @@ def _parse_openrouter_error_body(exc: urllib.error.HTTPError) -> str:
     try:
         body = exc.read().decode("utf-8", errors="replace")
         err_json = json.loads(body)
-        err_obj = err_json.get("error", {}) if isinstance(err_json, dict) else {}
-        if isinstance(err_obj, dict):
-            msg = err_obj.get("message")
-            if isinstance(msg, str) and msg.strip():
-                raw_msg = msg.strip()
+        if isinstance(err_json, dict):
+            err_obj = err_json.get("error")
+            if isinstance(err_obj, dict):
+                msg = err_obj.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    return msg.strip()
+            for k in ("detail", "message", "title"):
+                val = err_json.get(k)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        if body.strip():
+            raw_msg = body.strip()[:300]
     except Exception:
         pass
     return raw_msg
+
+
+def _classify_provider_http_error(
+    code: int,
+    raw_msg: str,
+    api_key: str,
+    model: str,
+    view_name: str | None = None,
+    provider: str = "nvidia",
+) -> VisionClientError:
+    safe_msg = sanitize_secret(raw_msg, api_key)
+    lower = safe_msg.lower()
+    view_ctx = f" ({view_name})" if view_name else ""
+    label = "NVIDIA API" if provider == "nvidia" else "OpenRouter"
+    key_var = "NVIDIA_API_KEY" if provider == "nvidia" else "OPENROUTER_API_KEY"
+
+    if code == 401:
+        return OpenRouterAuthError(
+            f"Invalid {label} key. Check {key_var} in the backend environment configuration."
+        )
+    if code == 402:
+        return OpenRouterPaymentError(
+            f"{label} account has insufficient credits or quota exhausted. "
+            f"Check your {label} billing/credits."
+        )
+    if code == 403:
+        return OpenRouterPermissionError(
+            f"{label} model or account permission restriction for '{model}'. "
+            "Check your API key permissions and model access."
+        )
+    if code == 404 or "no endpoints found" in lower or "not a valid model" in lower:
+        return OpenRouterModelUnavailableError(
+            f"Configured {label} model '{model}' is unavailable or was not found in the {label} catalog."
+        )
+    if code == 429:
+        return OpenRouterRateLimitError(
+            f"{label} rate limit exceeded. Please wait a moment and try again."
+        )
+    if code in (500, 502, 503, 504):
+        return OpenRouterProviderError(
+            f"{label} provider or server error (HTTP {code}) while running '{model}'{view_ctx}. Please try again shortly."
+        )
+    if code == 400 and any(tok in lower for tok in ("image", "mime", "invalid_image", "base64", "media", "asset")):
+        return OpenRouterUnsupportedImageError(
+            f"{label} model '{model}' could not process the uploaded image{view_ctx}. "
+            "Please upload a clear JPG, PNG, or WEBP photo."
+        )
+
+    return VisionClientError(f"{label} error{view_ctx} (HTTP {code}): {safe_msg}")
 
 
 def _classify_openrouter_http_error(
@@ -319,43 +486,7 @@ def _classify_openrouter_http_error(
     model: str,
     view_name: str | None = None,
 ) -> VisionClientError:
-    safe_msg = sanitize_secret(raw_msg, api_key)
-    lower = safe_msg.lower()
-    view_ctx = f" ({view_name})" if view_name else ""
-
-    if code == 401:
-        return OpenRouterAuthError(
-            "Invalid OpenRouter API key. Check OPENROUTER_API_KEY in the backend .env file."
-        )
-    if code == 402:
-        return OpenRouterPaymentError(
-            "OpenRouter account has insufficient credits or payment is required. "
-            "Add credits or increase the key budget in OpenRouter."
-        )
-    if code == 403:
-        return OpenRouterPermissionError(
-            f"OpenRouter model or account permission restriction for '{model}'. "
-            "Check your OpenRouter key permissions and model access."
-        )
-    if code == 404 or "no endpoints found" in lower or "not a valid model" in lower:
-        return OpenRouterModelUnavailableError(
-            f"Configured OpenRouter model '{model}' is unavailable or was not found in the OpenRouter catalog."
-        )
-    if code == 429:
-        return OpenRouterRateLimitError(
-            "OpenRouter rate limit exceeded. Please wait a moment and try again."
-        )
-    if code in (500, 502, 503, 504):
-        return OpenRouterProviderError(
-            f"OpenRouter provider or server error (HTTP {code}) while running '{model}'{view_ctx}. Please try again shortly."
-        )
-    if code == 400 and any(tok in lower for tok in ("image", "mime", "invalid_image", "base64", "media")):
-        return OpenRouterUnsupportedImageError(
-            f"OpenRouter model '{model}' could not process the uploaded image{view_ctx}. "
-            "Please upload a clear JPG, PNG, or WEBP photo."
-        )
-
-    return VisionClientError(f"OpenRouter API error{view_ctx} (HTTP {code}): {safe_msg}")
+    return _classify_provider_http_error(code, raw_msg, api_key, model, view_name=view_name, provider="openrouter")
 
 
 def _is_timeout_exception(exc: Exception) -> bool:
@@ -414,6 +545,184 @@ def _fetch_openrouter_model_entry(api_key: str, model: str, base_url: str) -> di
     return None
 
 
+def is_nvidia_vision_model(model_id: str) -> bool:
+    """Checks whether an NVIDIA NIM catalog model ID supports multimodal vision-language chat."""
+    norm = (model_id or "").strip().lower()
+    if not norm:
+        return False
+    if norm in NVIDIA_VISION_MODELS:
+        return True
+    if any(bad in norm for bad in ("embed", "parse", "nvclip", "retriever", "safety", "guard", "reward", "translate", "coder", "video-detector", "chatqa")):
+        return False
+    return any(tok in norm for tok in ("-vl", "vision", "-omni", "gemma-3", "gemma-4", "neva", "vila", "cosmos-reason", "fuyu"))
+
+
+def _fetch_nvidia_catalog(api_key: str, base_url: str) -> list[dict]:
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": "ScanioAI/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        catalog = json.loads(resp.read().decode("utf-8"))
+    return catalog.get("data", []) if isinstance(catalog, dict) else []
+
+
+def _probe_nvidia_auth(api_key: str, model: str, base_url: str) -> tuple[bool, str | None, str | None]:
+    cache_key = hashlib.sha256(f"{base_url}|{model}|{api_key}".encode("utf-8")).hexdigest()
+    now = time.time()
+    cached = _NVIDIA_AUTH_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < NVIDIA_AUTH_PROBE_TTL_SEC:
+        res = cached[1]
+        return res["ok"], res.get("status"), res.get("error")
+
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": "ok"}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "ScanioAI/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        _NVIDIA_AUTH_CACHE[cache_key] = (now, {"ok": True})
+        return True, None, None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 400:
+            _NVIDIA_AUTH_CACHE[cache_key] = (now, {"ok": True})
+            return True, None, None
+        raw_msg = _parse_openrouter_error_body(exc)
+        classified = _classify_provider_http_error(exc.code, raw_msg, api_key, model, provider="nvidia")
+        status_map = {
+            401: "invalid_api_key",
+            402: "insufficient_credits",
+            403: "permission_denied",
+            404: "model_not_found",
+            429: "rate_limited",
+        }
+        st = status_map.get(exc.code, f"http_{exc.code}")
+        err = sanitize_secret(str(classified), api_key)
+        _NVIDIA_AUTH_CACHE[cache_key] = (now, {"ok": False, "status": st, "error": err})
+        return False, st, err
+    except Exception as exc:
+        st = "timeout" if _is_timeout_exception(exc) else "network_error"
+        return False, st, sanitize_secret(str(exc), api_key)
+
+
+def verify_nvidia_model_availability(
+    api_key: str,
+    model: str,
+    base_url: str = DEFAULT_NVIDIA_BASE_URL,
+    run_auth_probe: bool = False,
+) -> dict:
+    """
+    Verifies NVIDIA NIM model availability and multimodal vision support.
+    Optionally performs a cached lightweight auth probe for /api/v1/model-status.
+    """
+    if not api_key:
+        return {
+            "valid": False,
+            "status": "missing_key",
+            "error": "NVIDIA_API_KEY is not configured in the backend environment.",
+        }
+    if api_key.startswith("sk-or-v1-"):
+        return {
+            "valid": False,
+            "status": "misconfigured_provider_key",
+            "error": (
+                "Detected an OpenRouter key (sk-or-v1-...) inside NVIDIA_API_KEY while VISION_PROVIDER=nvidia. "
+                "Configure your NVIDIA key (nvapi-...) in NVIDIA_API_KEY."
+            ),
+        }
+
+    try:
+        catalog = _fetch_nvidia_catalog(api_key, base_url)
+    except urllib.error.HTTPError as exc:
+        raw_msg = _parse_openrouter_error_body(exc)
+        classified = _classify_provider_http_error(exc.code, raw_msg, api_key, model, provider="nvidia")
+        return {
+            "valid": False,
+            "status": f"http_{exc.code}",
+            "error": sanitize_secret(str(classified), api_key),
+        }
+    except Exception as exc:
+        st = "timeout" if _is_timeout_exception(exc) else "network_error"
+        return {
+            "valid": False,
+            "status": st,
+            "error": sanitize_secret(str(exc), api_key),
+        }
+
+    entry = next((m for m in catalog if isinstance(m, dict) and m.get("id") == model), None)
+    if not entry:
+        return {
+            "valid": False,
+            "status": "model_not_found",
+            "error": f"NVIDIA model '{model}' was not found in the NVIDIA NIM catalog at {base_url}.",
+        }
+
+    if not is_nvidia_vision_model(model):
+        return {
+            "valid": False,
+            "status": "unsupported_vision",
+            "vision_supported": False,
+            "error": (
+                f"Configured NVIDIA model '{model}' does not support image/vision input. "
+                f"Use a verified NVIDIA vision model such as '{DEFAULT_NVIDIA_MODEL}', "
+                "'google/gemma-4-31b-it', or 'meta/llama-3.2-90b-vision-instruct'."
+            ),
+        }
+
+    if run_auth_probe:
+        auth_ok, auth_status, auth_err = _probe_nvidia_auth(api_key, model, base_url)
+        if not auth_ok:
+            return {
+                "valid": False,
+                "status": auth_status or "auth_error",
+                "error": auth_err or "NVIDIA API key authentication failed.",
+            }
+
+    meta = NVIDIA_VISION_MODELS.get(model, {})
+    return {
+        "valid": True,
+        "status": "available",
+        "provider": "nvidia",
+        "model": entry.get("id", model),
+        "displayName": meta.get("displayName", model),
+        "visionSupported": True,
+        "structuredOutputSupported": meta.get("supportsStructured", False),
+        "responseFormatSupported": meta.get("supportsResponseFormat", True),
+        "supportsReasoning": False,
+    }
+
+
+def verify_vision_model_availability(
+    provider: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    run_auth_probe: bool = False,
+) -> dict:
+    if provider == "nvidia":
+        return verify_nvidia_model_availability(api_key, model, base_url, run_auth_probe=run_auth_probe)
+    return verify_openrouter_model_availability(api_key, model, base_url)
+
+
 def verify_openrouter_model_availability(
     api_key: str,
     model: str,
@@ -431,6 +740,15 @@ def verify_openrouter_model_availability(
             "valid": False,
             "status": "missing_key",
             "error": f"OPENROUTER_API_KEY is not set in backend .env at {ENV_FILE_PATH}.",
+        }
+    if api_key.startswith("nvapi-"):
+        return {
+            "valid": False,
+            "status": "misconfigured_provider_key",
+            "error": (
+                "Detected an NVIDIA API key (nvapi-...) inside OPENROUTER_API_KEY while VISION_PROVIDER=openrouter. "
+                "Move the key to NVIDIA_API_KEY and set VISION_PROVIDER=nvidia."
+            ),
         }
 
     key_ok, key_status, key_err = _check_openrouter_key(api_key, base_url, model)
@@ -1119,29 +1437,61 @@ def _parse_json_response(text_content: str, view_name: str) -> dict | list:
     )
 
 
-def _send_openrouter_chat_request(
+def _merge_system_into_user_message(payload: dict) -> dict | None:
+    """Folds system prompt into the user text part for NIM models that forbid system role with images."""
+    msgs = payload.get("messages")
+    if not isinstance(msgs, list) or len(msgs) < 2:
+        return None
+    sys_msg = msgs[0] if isinstance(msgs[0], dict) and msgs[0].get("role") == "system" else None
+    usr_msg = msgs[1] if isinstance(msgs[1], dict) and msgs[1].get("role") == "user" else None
+    if not sys_msg or not usr_msg:
+        return None
+    sys_text = str(sys_msg.get("content") or "").strip()
+    usr_content = usr_msg.get("content")
+    if isinstance(usr_content, list):
+        new_parts = []
+        merged = False
+        for part in usr_content:
+            if not merged and isinstance(part, dict) and part.get("type") == "text":
+                new_parts.append({"type": "text", "text": f"{sys_text}\n\n{part.get('text', '')}".strip()})
+                merged = True
+            else:
+                new_parts.append(part)
+        if not merged:
+            new_parts.insert(0, {"type": "text", "text": sys_text})
+        new_usr = {"role": "user", "content": new_parts}
+    else:
+        new_usr = {"role": "user", "content": f"{sys_text}\n\n{usr_content}".strip()}
+    out = dict(payload)
+    out["messages"] = [new_usr, *msgs[2:]]
+    return out
+
+
+def _send_chat_request(
     url: str,
     payload: dict,
     api_key: str,
     model: str,
     view_name: str,
+    provider: str = "openrouter",
 ) -> dict:
     current_payload = dict(payload)
     last_error: Exception | None = None
+    label = "NVIDIA API" if provider == "nvidia" else "OpenRouter"
 
-    for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "ScanioAI/1.0",
+    }
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "http://localhost:8080"
+        headers["X-Title"] = "Scanio AI"
+
+    for attempt in range(MAX_TRANSIENT_RETRIES + 3):
         body_bytes = json.dumps(current_payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body_bytes,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost:8080",
-                "X-Title": "Scanio AI",
-                "User-Agent": "ScanioAI/1.0",
-            },
-        )
+        req = urllib.request.Request(url, data=body_bytes, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=OPENROUTER_REQUEST_TIMEOUT_SEC) as response:
                 raw = response.read().decode("utf-8")
@@ -1153,7 +1503,8 @@ def _send_openrouter_chat_request(
             if exc.code in (500, 502, 503, 504) and attempt < MAX_TRANSIENT_RETRIES:
                 delay = 1.5 * (attempt + 1)
                 logger.warning(
-                    "Transient OpenRouter HTTP %s for %s (attempt %s/%s); retrying in %.1fs.",
+                    "Transient %s HTTP %s for %s (attempt %s/%s); retrying in %.1fs.",
+                    label,
                     exc.code,
                     view_name,
                     attempt + 1,
@@ -1161,39 +1512,66 @@ def _send_openrouter_chat_request(
                     delay,
                 )
                 time.sleep(delay)
-                last_error = _classify_openrouter_http_error(exc.code, raw_msg, api_key, model, view_name)
+                last_error = _classify_provider_http_error(
+                    exc.code, raw_msg, api_key, model, view_name=view_name, provider=provider
+                )
                 continue
 
-            # Compatibility fallback if upstream rejects reasoning or strict json_schema
             if exc.code == 400 and "reasoning" in lower and "reasoning" in current_payload:
                 current_payload = {k: v for k, v in current_payload.items() if k != "reasoning"}
                 continue
 
-            if exc.code == 400 and ("response_format" in lower or "json_schema" in lower) and "response_format" in current_payload:
+            if exc.code == 400 and any(tok in lower for tok in ("response_format", "json_schema", "strict", "grammar", "guided")) and "response_format" in current_payload:
                 rf = current_payload.get("response_format", {})
                 if isinstance(rf, dict) and rf.get("type") == "json_schema":
+                    js = rf.get("json_schema") or {}
+                    if isinstance(js, dict) and js.get("strict") and provider == "nvidia":
+                        current_payload = dict(current_payload)
+                        current_payload["response_format"] = {
+                            "type": "json_schema",
+                            "json_schema": {k: v for k, v in js.items() if k != "strict"},
+                        }
+                        continue
                     current_payload = dict(current_payload)
                     current_payload["response_format"] = {"type": "json_object"}
                     continue
                 current_payload = {k: v for k, v in current_payload.items() if k != "response_format"}
                 continue
 
-            raise _classify_openrouter_http_error(exc.code, raw_msg, api_key, model, view_name) from exc
+            if exc.code == 400 and "system" in lower:
+                merged = _merge_system_into_user_message(current_payload)
+                if merged is not None:
+                    current_payload = merged
+                    continue
+
+            raise _classify_provider_http_error(
+                exc.code, raw_msg, api_key, model, view_name=view_name, provider=provider
+            ) from exc
         except json.JSONDecodeError as exc:
             raise OpenRouterMalformedResponseError(
-                f"OpenRouter API returned an invalid JSON envelope for the {view_name} image."
+                f"{label} returned an invalid JSON envelope for the {view_name} image."
             ) from exc
         except Exception as exc:
             if _is_timeout_exception(exc):
                 raise OpenRouterTimeoutError(
-                    f"OpenRouter screening request timed out while analyzing the {view_name} image. Please try again."
+                    f"{label} screening request timed out while analyzing the {view_name} image. Please try again."
                 ) from exc
             sanitized = sanitize_secret(str(exc), api_key)
-            raise VisionClientError(f"OpenRouter connection error ({view_name}): {sanitized}") from exc
+            raise VisionClientError(f"{label} connection error ({view_name}): {sanitized}") from exc
 
     if isinstance(last_error, VisionClientError):
         raise last_error
-    raise OpenRouterProviderError(f"OpenRouter provider error for '{model}'.")
+    raise OpenRouterProviderError(f"{label} provider error for '{model}'.")
+
+
+def _send_openrouter_chat_request(
+    url: str,
+    payload: dict,
+    api_key: str,
+    model: str,
+    view_name: str,
+) -> dict:
+    return _send_chat_request(url, payload, api_key, model, view_name, provider="openrouter")
 
 
 def compute_box_iou(box_a: dict, box_b: dict) -> float:
@@ -1332,15 +1710,82 @@ def generate_arch_crops(
     return crops
 
 
+def prepare_image_for_provider(
+    image_bytes: bytes,
+    mime_type: str,
+    provider: str = "nvidia",
+) -> tuple[bytes, str]:
+    """
+    Preserves original bytes and MIME type (JPEG/PNG/WEBP) unless NVIDIA NIM's inline
+    base64 payload limit requires aspect-preserving size reduction (never cropping teeth).
+    """
+    if provider != "nvidia" or len(image_bytes) <= NVIDIA_INLINE_RAW_LIMIT_BYTES:
+        return image_bytes, mime_type
+
+    fmt_map = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
+    fmt = fmt_map.get(mime_type, "JPEG")
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            base = ImageOps.exif_transpose(img)
+            w, h = base.size
+            smallest: tuple[bytes, str] | None = None
+            for max_side in (1600, 1280, 1024, 860):
+                scaled = base.copy()
+                if max(w, h) > max_side:
+                    scaled.thumbnail((max_side, max_side))
+                if fmt in ("JPEG", "WEBP"):
+                    out_im = scaled.convert("RGB") if fmt == "JPEG" and scaled.mode not in ("RGB", "L") else scaled
+                    for q in (90, 82, 74, 65):
+                        buf = BytesIO()
+                        kwargs = {"format": fmt, "quality": q}
+                        if fmt == "JPEG":
+                            kwargs["optimize"] = True
+                        out_im.save(buf, **kwargs)
+                        data = buf.getvalue()
+                        if smallest is None or len(data) < len(smallest[0]):
+                            smallest = (data, mime_type)
+                        if len(data) <= NVIDIA_INLINE_RAW_LIMIT_BYTES:
+                            return data, mime_type
+                else:
+                    buf_png = BytesIO()
+                    scaled.save(buf_png, format="PNG", optimize=True)
+                    png_data = buf_png.getvalue()
+                    if smallest is None or len(png_data) < len(smallest[0]):
+                        smallest = (png_data, "image/png")
+                    if len(png_data) <= NVIDIA_INLINE_RAW_LIMIT_BYTES:
+                        return png_data, "image/png"
+            # Final high-efficiency JPEG fallback preserving full field of view under limit
+            for max_side in (1024, 860, 720, 640):
+                scaled = base.copy()
+                if max(w, h) > max_side:
+                    scaled.thumbnail((max_side, max_side))
+                out_im = scaled.convert("RGB") if scaled.mode not in ("RGB", "L") else scaled
+                for q in (82, 72, 62):
+                    buf = BytesIO()
+                    out_im.save(buf, format="JPEG", quality=q, optimize=True)
+                    data = buf.getvalue()
+                    if smallest is None or len(data) < len(smallest[0]):
+                        smallest = (data, "image/jpeg")
+                    if len(data) <= NVIDIA_INLINE_RAW_LIMIT_BYTES:
+                        return data, "image/jpeg"
+            if smallest is not None:
+                return smallest
+    except Exception:
+        pass
+    return image_bytes, mime_type
+
+
 def _build_chat_payload(
     prompt_text: str,
     image_bytes: bytes,
     mime_type: str,
     model: str,
     caps: dict,
+    provider: str = "openrouter",
 ) -> dict:
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    data_url = f"data:{mime_type};base64,{b64_image}"
+    prepared_bytes, effective_mime = prepare_image_for_provider(image_bytes, mime_type, provider=provider)
+    b64_image = base64.b64encode(prepared_bytes).decode("utf-8")
+    data_url = f"data:{effective_mime};base64,{b64_image}"
     payload: dict = {
         "model": model,
         "temperature": 0.0,
@@ -1356,19 +1801,23 @@ def _build_chat_payload(
             },
         ],
     }
-    if caps.get("structuredOutputSupported", True):
+    if caps.get("structuredOutputSupported", provider != "nvidia"):
+        json_schema_cfg: dict = {
+            "name": "dental_screening",
+            "schema": OPENROUTER_JSON_SCHEMA,
+        }
+        if provider == "openrouter":
+            json_schema_cfg["strict"] = True
         payload["response_format"] = {
             "type": "json_schema",
-            "json_schema": {
-                "name": "dental_screening",
-                "strict": True,
-                "schema": OPENROUTER_JSON_SCHEMA,
-            },
+            "json_schema": json_schema_cfg,
         }
     elif caps.get("responseFormatSupported"):
         payload["response_format"] = {"type": "json_object"}
 
-    if caps.get("supportsReasoning", "gemini-2.5" in model.lower() or "gemini-3" in model.lower()):
+    if provider == "openrouter" and caps.get(
+        "supportsReasoning", "gemini-2.5" in model.lower() or "gemini-3" in model.lower()
+    ):
         payload["reasoning"] = {"max_tokens": 2048}
     return payload
 
@@ -1453,19 +1902,20 @@ def _derive_module_status(
     return "assessed_no_findings"
 
 
-def analyze_with_openrouter(
+def analyze_with_vision_provider(
     image_bytes: bytes,
     view_name: str,
     api_key: str,
     model: str,
-    base_url: str = DEFAULT_OPENROUTER_BASE_URL,
+    base_url: str,
+    provider: str = "nvidia",
     mime_type: str | None = None,
     capabilities: dict | None = None,
     enable_crop_fallback: bool = True,
 ) -> dict:
     """
-    Submits dental image bytes to OpenRouter Chat Completions API using multimodal image_url
-    content with base64 data URL and exact MIME type, with quality metrics and optional
+    Submits dental image bytes to NVIDIA NIM or OpenRouter Chat Completions API using
+    multimodal image_url content with preserved MIME type, quality metrics, and optional
     overlapping regional crop refinement.
     """
     detected_mime = mime_type or detect_image_mime_type(image_bytes)
@@ -1481,9 +1931,13 @@ def analyze_with_openrouter(
         detected_mime,
         model,
         caps,
+        provider=provider,
     )
 
-    result = _send_openrouter_chat_request(url, payload, api_key, model, view_name)
+    if provider == "openrouter":
+        result = _send_openrouter_chat_request(url, payload, api_key, model, view_name)
+    else:
+        result = _send_chat_request(url, payload, api_key, model, view_name, provider=provider)
     text_content = _extract_openrouter_text(result, view_name)
     parsed = _parse_json_response(text_content, view_name)
     extracted = _parse_parsed_payload(parsed, view_name)
@@ -1552,15 +2006,17 @@ def analyze_with_openrouter(
                     detected_mime,
                     model,
                     caps,
+                    provider=provider,
                 )
                 try:
-                    crop_res = _send_openrouter_chat_request(
-                        url,
-                        crop_payload,
-                        api_key,
-                        model,
-                        f"{view_name}:{region}",
-                    )
+                    if provider == "openrouter":
+                        crop_res = _send_openrouter_chat_request(
+                            url, crop_payload, api_key, model, f"{view_name}:{region}"
+                        )
+                    else:
+                        crop_res = _send_chat_request(
+                            url, crop_payload, api_key, model, f"{view_name}:{region}", provider=provider
+                        )
                     crop_text = _extract_openrouter_text(crop_res, f"{view_name}:{region}")
                     crop_parsed = _parse_json_response(crop_text, f"{view_name}:{region}")
                     crop_ext = _parse_parsed_payload(crop_parsed, f"{view_name}:{region}")
@@ -1666,3 +2122,49 @@ def analyze_with_openrouter(
         "cropsAnalyzed": crops_analyzed,
         "usage": result.get("usage", {}),
     }
+
+
+def analyze_with_nvidia(
+    image_bytes: bytes,
+    view_name: str,
+    api_key: str,
+    model: str = DEFAULT_NVIDIA_MODEL,
+    base_url: str = DEFAULT_NVIDIA_BASE_URL,
+    mime_type: str | None = None,
+    capabilities: dict | None = None,
+    enable_crop_fallback: bool = True,
+) -> dict:
+    return analyze_with_vision_provider(
+        image_bytes,
+        view_name,
+        api_key,
+        model,
+        base_url,
+        provider="nvidia",
+        mime_type=mime_type,
+        capabilities=capabilities,
+        enable_crop_fallback=enable_crop_fallback,
+    )
+
+
+def analyze_with_openrouter(
+    image_bytes: bytes,
+    view_name: str,
+    api_key: str,
+    model: str,
+    base_url: str = DEFAULT_OPENROUTER_BASE_URL,
+    mime_type: str | None = None,
+    capabilities: dict | None = None,
+    enable_crop_fallback: bool = True,
+) -> dict:
+    return analyze_with_vision_provider(
+        image_bytes,
+        view_name,
+        api_key,
+        model,
+        base_url,
+        provider="openrouter",
+        mime_type=mime_type,
+        capabilities=capabilities,
+        enable_crop_fallback=enable_crop_fallback,
+    )

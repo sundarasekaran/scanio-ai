@@ -116,7 +116,7 @@ class ScreeningResponse(BaseModel):
         "AI-assisted screening only. This result is not a diagnosis and must be reviewed by a qualified dental professional."
     )
     isMock: bool = False
-    modelProvider: str = "openrouter (google/gemini-2.5-flash)"
+    modelProvider: str = "nvidia (nvidia/nemotron-3.5-super-vl-120b-a12b)"
     inconclusive: bool = False
     inconclusiveViews: list[str] = Field(default_factory=list)
     inconclusiveReasons: dict[str, str] = Field(default_factory=dict)

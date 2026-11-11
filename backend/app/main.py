@@ -106,35 +106,35 @@ async def predict(
         result = run_screening(images)
         return ScreeningResponse.model_validate(result)
     except (ModelNotReady, OpenRouterConfigError) as exc:
-        logger.warning("Screening blocked - OpenRouter not configured: %s", sanitize_secret(str(exc)))
+        logger.warning("Screening blocked - vision provider not configured: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except OpenRouterAuthError as exc:
-        logger.error("OpenRouter authentication failure: %s", sanitize_secret(str(exc)))
+        logger.error("Vision API authentication failure: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except OpenRouterPaymentError as exc:
-        logger.warning("OpenRouter payment/credits required: %s", sanitize_secret(str(exc)))
+        logger.warning("Vision API payment/credits required: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except OpenRouterPermissionError as exc:
-        logger.warning("OpenRouter permission error: %s", sanitize_secret(str(exc)))
+        logger.warning("Vision API permission error: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except OpenRouterModelUnavailableError as exc:
-        logger.warning("OpenRouter model unavailable: %s", sanitize_secret(str(exc)))
+        logger.warning("Vision model unavailable: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except OpenRouterRateLimitError as exc:
-        logger.warning("OpenRouter rate limit exceeded: %s", sanitize_secret(str(exc)))
+        logger.warning("Vision API rate limit exceeded: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except OpenRouterTimeoutError as exc:
-        logger.warning("OpenRouter request timed out: %s", sanitize_secret(str(exc)))
+        logger.warning("Vision API request timed out: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except OpenRouterUnsupportedImageError as exc:
-        logger.warning("OpenRouter rejected image: %s", sanitize_secret(str(exc)))
+        logger.warning("Vision API rejected image: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=415, detail=str(exc)) from exc
     except OpenRouterMalformedResponseError as exc:
-        logger.error("Malformed OpenRouter response: %s", sanitize_secret(str(exc)))
+        logger.error("Malformed vision response: %s", sanitize_secret(str(exc)))
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except (OpenRouterProviderError, OpenRouterAPIError, VisionClientError, RuntimeError) as exc:
         safe_msg = sanitize_secret(str(exc))
-        logger.error("OpenRouter upstream error: %s", safe_msg, exc_info=True)
+        logger.error("Vision upstream error: %s", safe_msg, exc_info=True)
         raise HTTPException(status_code=502, detail=safe_msg) from exc
     except ValueError as exc:
         safe_msg = sanitize_secret(str(exc))

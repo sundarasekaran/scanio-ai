@@ -242,27 +242,27 @@ function normalizeConditionList(list: unknown): DetectedCondition[] {
 function fallbackStatusError(status: number): string {
   switch (status) {
     case 401:
-      return "Invalid OpenRouter API key. Check OPENROUTER_API_KEY in the backend .env file.";
+      return "Invalid vision API key. Check NVIDIA_API_KEY in the backend environment configuration.";
     case 402:
-      return "OpenRouter account has insufficient credits or payment is required. Check your OpenRouter balance and key limits.";
+      return "Vision provider account has insufficient credits or quota exhausted. Check your provider billing/credits.";
     case 403:
-      return "OpenRouter model or account permission restriction. Verify model access for your API key.";
+      return "Vision model or account permission restriction. Verify model access for your API key.";
     case 404:
-      return "Configured OpenRouter vision model is unavailable or not found. Check OPENROUTER_MODEL in backend .env.";
+      return "Configured vision model is unavailable or not found. Check NVIDIA_MODEL in the backend environment.";
     case 413:
       return "Uploaded image exceeds the maximum allowed size limit.";
     case 415:
       return "Unsupported image format. Please upload clear JPG, PNG, or WEBP photos.";
     case 429:
-      return "OpenRouter rate limit exceeded. Please wait a moment and try again.";
+      return "Vision API rate limit exceeded. Please wait a moment and try again.";
     case 502:
       return "Vision provider returned a malformed or upstream error response. Please retry with clearer photos.";
     case 503:
-      return "Screening service is not configured yet. Verify OPENROUTER_API_KEY in backend .env.";
+      return "Screening service is not configured yet. Verify NVIDIA_API_KEY and VISION_PROVIDER in the backend environment.";
     case 504:
-      return "Dental screening request timed out while waiting for the OpenRouter vision model. Please try again.";
+      return "Dental screening request timed out while waiting for the vision model. Please try again.";
     case 500:
-      return "Backend internal error during dental screening. Please check the backend terminal logs.";
+      return "Backend internal error during dental screening. Please check the backend server logs.";
     default:
       return `Screening service returned status ${status}.`;
   }

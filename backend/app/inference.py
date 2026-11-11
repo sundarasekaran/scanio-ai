@@ -1,5 +1,5 @@
 """
-Inference coordinator for Scanio AI dental screening via OpenRouter Vision API.
+Inference coordinator for Scanio AI dental screening (NVIDIA NIM & OpenRouter).
 
 Supports TWO independent screening modules:
 1. TOOTH-SURFACE CONDITION ANALYSIS (enamel caries, discoloration, cracks, plaque, tartar/calculus)
@@ -19,16 +19,19 @@ from app.vision_client import (
     OpenRouterRateLimitError,
     OpenRouterTimeoutError,
     VisionClientError,
+    analyze_with_nvidia,
     analyze_with_openrouter,
     assess_image_quality,
-    get_openrouter_config,
+    get_vision_config,
     sanitize_secret,
+    verify_nvidia_model_availability,
     verify_openrouter_model_availability,
 )
 
 logger = logging.getLogger("scanio.inference")
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+SUPPORTED_PROVIDERS = ("nvidia", "openrouter")
 
 
 class ModelNotReady(RuntimeError):
@@ -41,7 +44,7 @@ class OpenRouterAPIError(VisionClientError):
 
 def _raise_verification_error(verification: dict, api_key: str) -> None:
     status = str(verification.get("status") or "").lower()
-    err = sanitize_secret(verification.get("error", "OpenRouter verification failed"), api_key)
+    err = sanitize_secret(verification.get("error", "Vision provider verification failed"), api_key)
 
     if status == "invalid_api_key":
         raise OpenRouterAuthError(err)
@@ -59,8 +62,8 @@ def _raise_verification_error(verification: dict, api_key: str) -> None:
 
 
 def model_status() -> dict:
-    """Returns live OpenRouter model and configuration status for GET /api/v1/model-status."""
-    config = get_openrouter_config()
+    """Returns active vision provider and model status for GET /api/v1/model-status (without secrets)."""
+    config = get_vision_config()
     provider = config["provider"]
     model = config["model"]
     base_url = config["base_url"]
@@ -69,21 +72,26 @@ def model_status() -> dict:
     env_path = config["env_path"]
     env_exists = config["env_exists"]
 
-    if provider != "openrouter":
+    if provider not in SUPPORTED_PROVIDERS:
         return {
             "vision_provider": provider,
             "selected_model": model,
+            "base_url": base_url,
             "api_key_configured": has_key,
             "screening_ready": False,
             "model_availability": "unsupported_provider",
             "env_file_loaded": env_exists,
             "env_file_path": env_path,
-            "message": f"Unsupported VISION_PROVIDER '{provider}'. Set VISION_PROVIDER=openrouter in backend .env.",
+            "message": f"Unsupported VISION_PROVIDER '{provider}'. Set VISION_PROVIDER=nvidia or openrouter.",
         }
 
+    key_var = "NVIDIA_API_KEY" if provider == "nvidia" else "OPENROUTER_API_KEY"
+    provider_label = "NVIDIA API" if provider == "nvidia" else "OpenRouter"
+
     status_response = {
-        "vision_provider": "openrouter",
+        "vision_provider": provider,
         "selected_model": model,
+        "base_url": base_url,
         "api_key_configured": has_key,
         "screening_ready": False,
         "model_availability": "not_configured",
@@ -95,12 +103,15 @@ def model_status() -> dict:
     if not has_key:
         status_response["model_availability"] = "missing_key"
         status_response["message"] = (
-            f"OPENROUTER_API_KEY is missing or empty in {env_path}. "
-            "Please add OPENROUTER_API_KEY=your_key and save the file."
+            f"{key_var} is missing or empty. Configure {key_var} in the backend environment."
         )
         return status_response
 
-    verification = verify_openrouter_model_availability(api_key, model, base_url)
+    if provider == "nvidia":
+        verification = verify_nvidia_model_availability(api_key, model, base_url, run_auth_probe=True)
+    else:
+        verification = verify_openrouter_model_availability(api_key, model, base_url)
+
     if verification.get("valid"):
         status_response["screening_ready"] = True
         status_response["model_availability"] = "available"
@@ -108,7 +119,7 @@ def model_status() -> dict:
         status_response["vision_supported"] = verification.get("visionSupported", True)
         status_response["structured_output_supported"] = verification.get("structuredOutputSupported", False)
         status_response["message"] = (
-            f"OpenRouter vision model '{model}' is verified and ready for dual-module dental screening."
+            f"{provider_label} vision model '{model}' is verified and ready for dual-module dental screening."
         )
     else:
         status_response["screening_ready"] = False
@@ -121,37 +132,46 @@ def model_status() -> dict:
 
 def run_screening(images: dict[str, bytes]) -> dict:
     """
-    Submits uploaded upper, lower, and front dental photos to OpenRouter Chat Completions API.
-    Verifies key and vision model compatibility, validates tooth-level boxes, aggregates
-    dual-module findings, flags inconclusive views, and calculates oral health scores.
+    Submits uploaded upper, lower, and front dental photos to the configured Vision API
+    (NVIDIA NIM or OpenRouter). Validates tooth-level boxes, aggregates dual-module
+    findings, flags inconclusive views, and calculates oral health scores.
     """
-    config = get_openrouter_config()
-    if config["provider"] != "openrouter":
+    config = get_vision_config()
+    provider = config["provider"]
+    if provider not in SUPPORTED_PROVIDERS:
         raise OpenRouterConfigError(
-            f"Unsupported VISION_PROVIDER '{config['provider']}'. Set VISION_PROVIDER=openrouter in {config['env_path']}."
+            f"Unsupported VISION_PROVIDER '{provider}'. Set VISION_PROVIDER=nvidia or openrouter."
         )
 
+    key_var = "NVIDIA_API_KEY" if provider == "nvidia" else "OPENROUTER_API_KEY"
     if not config["has_key"]:
         raise ModelNotReady(
-            f"OPENROUTER_API_KEY is not configured or empty. Add OPENROUTER_API_KEY=your_key to {config['env_path']}."
+            f"{key_var} is not configured or empty. Configure {key_var} in Render or backend .env."
         )
 
     api_key = config["api_key"]
     model = config["model"]
     base_url = config["base_url"]
+    provider_label = "NVIDIA NIM" if provider == "nvidia" else "OpenRouter"
 
-    verification = verify_openrouter_model_availability(api_key, model, base_url)
+    if provider == "nvidia":
+        verification = verify_nvidia_model_availability(api_key, model, base_url, run_auth_probe=False)
+        analyzer = analyze_with_nvidia
+    else:
+        verification = verify_openrouter_model_availability(api_key, model, base_url)
+        analyzer = analyze_with_openrouter
+
     if not verification.get("valid"):
         _raise_verification_error(verification, api_key)
 
     views_order = ("upper", "lower", "front")
-    logger.info("Submitting upper, lower, and front images to OpenRouter (%s)...", model)
+    logger.info("Submitting upper, lower, and front images to %s (%s)...", provider_label, model)
 
     view_results: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
             view: executor.submit(
-                analyze_with_openrouter,
+                analyzer,
                 images[view],
                 view,
                 api_key,
@@ -292,13 +312,13 @@ def run_screening(images: dict[str, bytes]) -> dict:
         "imageQuality": image_quality_map,
         "viewDiagnostics": view_diagnostics,
         "screeningDisclaimer": (
-            f"AI-assisted preliminary screening via OpenRouter ({model}). "
+            f"AI-assisted preliminary screening via {provider_label} ({model}). "
             "Separates Tooth-Surface Conditions (Module 1) and Dental Alignment (Module 2). "
             "Bounding boxes localize individual visible teeth, surfaces, and interdental alignment features only. "
             "This result is not a diagnosis and must be reviewed by a qualified dental professional."
         ),
         "isMock": False,
-        "modelProvider": f"openrouter ({model})",
+        "modelProvider": f"{provider} ({model})",
         "inconclusive": is_inconclusive,
         "inconclusiveViews": inconclusive_views,
         "inconclusiveReasons": inconclusive_reasons,
