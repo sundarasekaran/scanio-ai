@@ -318,19 +318,41 @@ def sanitize_secret(text: str, secret: str = "") -> str:
 
 def _read_env_file_vars() -> dict[str, str]:
     values: dict[str, str] = {}
-    if not ENV_FILE_PATH.is_file():
-        return values
-    try:
-        load_dotenv(ENV_FILE_PATH, override=True)
-        for raw_line in ENV_FILE_PATH.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            values[k.strip()] = v.strip().strip('"').strip("'")
-    except Exception as exc:
-        logger.warning("Error reading .env file at %s: %s", ENV_FILE_PATH, exc)
+    candidates = [ENV_FILE_PATH, BASE_DIR.parent / ".env", Path("/etc/secrets/.env")]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            # Local backend/.env overrides shell env during dev; other candidates only fill missing keys.
+            load_dotenv(path, override=(path == ENV_FILE_PATH))
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                norm_k = k.strip()
+                if norm_k and (path == ENV_FILE_PATH or norm_k not in values):
+                    values[norm_k] = v.strip().strip('"').strip("'")
+        except Exception as exc:
+            logger.warning("Error reading .env file at %s: %s", path, exc)
     return values
+
+
+def _lookup_os_env(key: str) -> str:
+    if key in os.environ:
+        return os.environ[key]
+    target = key.strip().upper()
+    for env_k, env_v in os.environ.items():
+        if env_k.strip().upper() == target:
+            return env_v
+    return ""
+
+
+def _clean_api_key_value(raw_val: str) -> str:
+    cleaned = raw_val.strip().strip('"').strip("'")
+    if cleaned.lower().startswith("bearer "):
+        cleaned = cleaned[7:].strip()
+    return cleaned
 
 
 def load_backend_env() -> dict:
@@ -338,15 +360,15 @@ def load_backend_env() -> dict:
     file_vars = _read_env_file_vars()
 
     def _pick(key: str, default: str = "") -> str:
-        val = file_vars.get(key) or os.environ.get(key, "")
+        val = file_vars.get(key) or _lookup_os_env(key)
         return val.strip().strip('"').strip("'") or default
 
     raw_provider = _pick("VISION_PROVIDER", "").lower()
-    nv_key = _pick("NVIDIA_API_KEY", "")
+    nv_key = _clean_api_key_value(_pick("NVIDIA_API_KEY", ""))
     nv_model = _pick("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL)
     nv_base_url = _pick("NVIDIA_BASE_URL", DEFAULT_NVIDIA_BASE_URL).rstrip("/")
 
-    or_key = _pick("OPENROUTER_API_KEY", "")
+    or_key = _clean_api_key_value(_pick("OPENROUTER_API_KEY", ""))
     or_model = _pick("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
     or_base_url = _pick("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL).rstrip("/")
 
@@ -391,6 +413,7 @@ def load_backend_env() -> dict:
         "has_key": bool(effective_key),
         "nvidia_configured": bool(nv_key),
         "openrouter_configured": bool(or_key),
+        "openrouter_has_nvapi_key": bool(or_key.startswith("nvapi-")),
         "env_path": str(ENV_FILE_PATH),
         "env_exists": ENV_FILE_PATH.is_file(),
     }

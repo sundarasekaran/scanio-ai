@@ -102,9 +102,15 @@ def model_status() -> dict:
 
     if not has_key:
         status_response["model_availability"] = "missing_key"
-        status_response["message"] = (
-            f"{key_var} is missing or empty. Configure {key_var} in the backend environment."
-        )
+        if provider == "nvidia" and config.get("openrouter_has_nvapi_key"):
+            status_response["message"] = (
+                "NVIDIA_API_KEY is missing or empty, while OPENROUTER_API_KEY contains an nvapi-... key. "
+                "Add NVIDIA_API_KEY in Render Environment Variables and redeploy the service."
+            )
+        else:
+            status_response["message"] = (
+                f"{key_var} is missing or empty. Configure {key_var} in the backend environment."
+            )
         return status_response
 
     if provider == "nvidia":
@@ -145,6 +151,11 @@ def run_screening(images: dict[str, bytes]) -> dict:
 
     key_var = "NVIDIA_API_KEY" if provider == "nvidia" else "OPENROUTER_API_KEY"
     if not config["has_key"]:
+        if provider == "nvidia" and config.get("openrouter_has_nvapi_key"):
+            raise ModelNotReady(
+                "NVIDIA_API_KEY is not configured or empty (OPENROUTER_API_KEY still holds an nvapi-... key). "
+                "Add NVIDIA_API_KEY in Render Environment Variables and redeploy the service."
+            )
         raise ModelNotReady(
             f"{key_var} is not configured or empty. Configure {key_var} in Render or backend .env."
         )

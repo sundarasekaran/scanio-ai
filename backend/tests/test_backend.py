@@ -381,6 +381,22 @@ class BackendTestCase(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
+                "VISION_PROVIDER": "nvidia",
+                "NVIDIA_API_KEY ": "Bearer nvapi-clean-isolated-key",
+                "NVIDIA_MODEL": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+                "NVIDIA_BASE_URL": "https://integrate.api.nvidia.com/v1",
+            },
+            clear=True,
+        ):
+            isolated = load_backend_env()
+            self.assertEqual(isolated["provider"], "nvidia")
+            self.assertEqual(isolated["api_key"], "nvapi-clean-isolated-key")
+            self.assertTrue(isolated["has_key"])
+            self.assertFalse(isolated["openrouter_configured"])
+
+        with patch.dict(
+            "os.environ",
+            {
                 "VISION_PROVIDER": "openrouter",
                 "OPENROUTER_API_KEY": "nvapi-misplaced",
                 "NVIDIA_API_KEY": "nvapi-real-env-key",
